@@ -22,7 +22,7 @@ class RiskManager:
     def __init__(self, config):
         """Initialize service."""
         self.config = config
-        self.nats = NATSClient(config.nats.url)
+        self.nats = NATSClient(config.infrastructure.nats.url)
         self._running = False
         self._checks_performed = 0
         self._alerts_issued = 0

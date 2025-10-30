@@ -22,7 +22,7 @@ class VolflowEstimator:
     def __init__(self, config):
         """Initialize service."""
         self.config = config
-        self.nats = NATSClient(config.nats.url)
+        self.nats = NATSClient(config.infrastructure.nats.url)
         self._running = False
         self._measurements = 0
         self._estimates_published = 0

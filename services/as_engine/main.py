@@ -23,7 +23,7 @@ class AvellanedaStoikovEngine:
     def __init__(self, config):
         """Initialize service."""
         self.config = config
-        self.nats = NATSClient(config.nats.url)
+        self.nats = NATSClient(config.infrastructure.nats.url)
         self._running = False
         self._quotes_generated = 0
         self._quotes_published = 0

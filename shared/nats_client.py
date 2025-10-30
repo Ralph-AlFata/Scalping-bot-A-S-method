@@ -60,11 +60,11 @@ class NATSClient:
             return
 
         try:
+            # For nats-py 2.6+, use simpler connection parameters
+            # The library handles reconnection automatically
             self.nc = await nats.connect(
                 self.url,
                 name=self.name,
-                max_reconnect_attempts=self.max_reconnect_attempts,
-                reconnect_wait=self.reconnect_wait_sec,
             )
 
             # Enable JetStream

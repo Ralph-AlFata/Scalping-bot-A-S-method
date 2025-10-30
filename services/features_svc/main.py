@@ -22,7 +22,7 @@ class FeaturesService:
     def __init__(self, config):
         """Initialize service."""
         self.config = config
-        self.nats = NATSClient(config.nats.url)
+        self.nats = NATSClient(config.infrastructure.nats.url)
         self._running = False
         self._messages_processed = 0
         self._messages_published = 0
