@@ -1,0 +1,86 @@
+# Prometheus configuration for market-making system
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: "market-maker-monitor"
+
+# Alerting configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+# Load rules files (optional)
+rule_files: []
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus itself
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # MarketData Gateway
+  - job_name: "marketdata_gw"
+    static_configs:
+      - targets: ["localhost:8001"]
+    metrics_path: "/metrics"
+    scrape_interval: 5s
+
+  # Features Service
+  - job_name: "features_svc"
+    static_configs:
+      - targets: ["localhost:8002"]
+    metrics_path: "/metrics"
+    scrape_interval: 5s
+
+  # Volatility & Order Flow
+  - job_name: "volflow_estimator"
+    static_configs:
+      - targets: ["localhost:8003"]
+    metrics_path: "/metrics"
+    scrape_interval: 5s
+
+  # Avellaneda-Stoikov Engine
+  - job_name: "as_engine"
+    static_configs:
+      - targets: ["localhost:8004"]
+    metrics_path: "/metrics"
+    scrape_interval: 5s
+
+  # Order Router
+  - job_name: "order_router"
+    static_configs:
+      - targets: ["localhost:8005"]
+    metrics_path: "/metrics"
+    scrape_interval: 5s
+
+  # Inventory Service
+  - job_name: "inventory_svc"
+    static_configs:
+      - targets: ["localhost:8006"]
+    metrics_path: "/metrics"
+    scrape_interval: 5s
+
+  # Risk Manager
+  - job_name: "risk_manager"
+    static_configs:
+      - targets: ["localhost:8007"]
+    metrics_path: "/metrics"
+    scrape_interval: 5s
+
+  # Metrics Service
+  - job_name: "metrics_svc"
+    static_configs:
+      - targets: ["localhost:8008"]
+    metrics_path: "/metrics"
+    scrape_interval: 5s
+
+  # Backtest Engine
+  - job_name: "sim_backtest"
+    static_configs:
+      - targets: ["localhost:8009"]
+    metrics_path: "/metrics"
+    scrape_interval: 10s

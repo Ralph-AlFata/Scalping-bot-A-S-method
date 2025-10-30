@@ -1,0 +1,240 @@
+# Market Maker Configuration
+# Avellaneda-Stoikov Strategy for Binance USDT-M Futures
+
+system:
+  name: "Avellaneda-Stoikov Market Maker"
+  version: "0.1.0"
+  symbol: ${SYMBOL:BTCUSDT}
+  environment: ${ENVIRONMENT:development}
+  log_level: ${LOG_LEVEL:INFO}
+  log_format: ${LOG_FORMAT:console}  # json or console
+  debug: ${DEBUG:false}
+  dry_run: ${DRY_RUN:true}
+  simulate: ${SIMULATE:false}
+
+# Binance Exchange Configuration
+binance:
+  api_key: ${BINANCE_API_KEY:}
+  api_secret: ${BINANCE_API_SECRET:}
+  testnet: ${BINANCE_TESTNET:true}
+  base_url: https://testnet.binancefuture.com
+  ws_url: wss://stream.binancefuture.com
+  request_timeout_sec: 10
+  max_retries: 3
+  retry_backoff_sec: 1
+
+# Avellaneda-Stoikov Strategy Parameters
+strategy:
+  avellaneda_stoikov:
+    gamma: ${GAMMA:0.10}              # Risk aversion coefficient (0.01 to 1.0)
+    time_horizon: ${TIME_HORIZON:5.0} # T-t remaining time (seconds)
+    alpha_skew: ${ALPHA_SKEW:0.40}    # OFI directional strength (0.0 to 1.0)
+
+  # Quote Generation Parameters
+  quoting:
+    min_spread_bps: 5.0               # Minimum spread (basis points)
+    max_spread_bps: 50.0              # Maximum spread (basis points)
+    quote_size_usd: ${QUOTE_SIZE_USDT:50.0}  # Size per quote (USD notional)
+    max_quote_size_usd: 500.0         # Maximum single order size
+    update_freq_ms: 100               # Quote update frequency (milliseconds)
+
+  # Inventory Management
+  inventory:
+    target_inventory: 0.0             # Target position (quantity)
+    max_long_qty: ${MAX_INVENTORY_BTC:0.02}    # Maximum long position
+    max_short_qty: 0.02               # Maximum short position
+    inventory_adjustment_factor: 0.5  # How aggressively to adjust quotes for inventory
+
+  # Features Configuration
+  features:
+    ofi_window_ticks: 50              # Ticks for OFI calculation
+    ofi_z_score_threshold: 1.5        # Z-score threshold for OFI signal
+    micro_price_alpha: 0.5            # Micro-price moving average (0.0 to 1.0)
+    queue_imbalance_depth: 10         # Depth levels for queue imbalance
+
+  # Volatility and Order Intensity
+  volflow:
+    volatility_lookback_sec: 60       # Volatility window (seconds)
+    volatility_min: 0.0005            # Minimum volatility (prevents division by zero)
+    volatility_max: 1.0               # Maximum volatility cap
+
+    order_intensity_window_sec: 60    # Order intensity lookback window
+    order_intensity_k_min: 0.1        # Minimum k parameter
+    order_intensity_k_max: 10.0       # Maximum k parameter
+
+    vpin_threshold_normal: 0.4        # VPIN below this is normal
+    vpin_threshold_elevated: 0.7      # VPIN above this is elevated
+    vpin_threshold_toxic: 0.9         # VPIN above this is toxic
+
+# Risk Management Configuration
+risk:
+  # Position Limits
+  max_inventory_btc: ${MAX_INVENTORY_BTC:0.02}
+  max_position_notional_usd: ${MAX_POSITION_NOTIONAL:1000.0}
+
+  # Loss Limits
+  stop_loss_pct: ${STOP_LOSS_PCT:-0.01}      # Stop loss at -1%
+  daily_loss_limit_usd: 500.0                # Daily loss limit
+
+  # Funding Rate Guard
+  max_funding_rate_pct: 0.01                 # 1% funding rate limit
+  funding_rate_check_interval_sec: 300       # Check every 5 minutes
+
+  # Circuit Breaker
+  circuit_breaker_enabled: true
+  circuit_breaker_loss_pct: -0.05            # Trigger at -5%
+  circuit_breaker_pause_sec: 600             # Pause 10 minutes on trigger
+
+  # Order Throttling
+  max_orders_per_minute: 100
+  min_order_interval_ms: 100
+
+# Infrastructure Configuration
+infrastructure:
+  # NATS Message Broker
+  nats:
+    url: ${NATS_URL:nats://localhost:4222}
+    jetstream_enabled: ${NATS_JETSTREAM_ENABLED:true}
+    max_reconnect_attempts: 10
+    reconnect_wait_sec: 1
+    request_timeout_sec: 5
+    queue_size: 10000
+
+  # Redis Cache
+  redis:
+    host: ${REDIS_HOST:localhost}
+    port: ${REDIS_PORT:6379}
+    db: ${REDIS_DB:0}
+    password: null
+    ssl: false
+    socket_timeout_sec: 5
+    socket_connect_timeout_sec: 5
+    socket_keepalive: true
+    max_connections: 50
+
+  # TimescaleDB Database
+  timescaledb:
+    host: ${DB_HOST:localhost}
+    port: ${DB_PORT:5432}
+    user: ${DB_USER:postgres}
+    password: ${DB_PASSWORD:}
+    database: ${DB_NAME:marketmaker}
+    ssl: false
+    min_pool_size: 2
+    max_pool_size: 10
+    statement_cache_size: 100
+
+  # Prometheus Metrics
+  prometheus:
+    enabled: ${METRICS_ENABLED:true}
+    port: ${PROMETHEUS_PORT:8001}
+    addr: ${PROMETHEUS_ADDR:0.0.0.0}
+    path: /metrics
+    histogram_buckets: [0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0]
+
+# Data Retention Policies
+data_retention:
+  ticks_retention_days: 30          # Keep 1-minute OHLCV data for 30 days
+  trades_retention_days: 7          # Keep trade records for 7 days
+  orders_retention_days: 90         # Keep order history for 90 days
+  snapshots_retention_days: 365     # Keep daily position snapshots for 1 year
+
+# Monitoring and Alerts
+monitoring:
+  health_check_interval_sec: 60
+  health_check_timeout_sec: 10
+
+  # Alert Thresholds
+  alerts:
+    message_latency_ms: 1000        # Alert if processing > 1s
+    exchange_latency_ms: 500        # Alert if API response > 500ms
+    database_latency_ms: 100        # Alert if DB query > 100ms
+    cache_miss_rate: 0.1            # Alert if cache miss rate > 10%
+
+# Development and Testing
+development:
+  # Simulation Mode
+  simulate:
+    enabled: ${SIMULATE:false}
+    speed_multiplier: 1.0
+    slippage_bps: 2.0
+
+  # Backtest Configuration
+  backtest:
+    start_date: "2024-01-01"
+    end_date: "2024-06-01"
+    initial_capital_usd: 10000.0
+    use_real_data: true
+
+  # Logging Details
+  verbose_logging: false
+  log_all_quotes: false
+  log_all_orders: true
+
+  # Seed for Reproducibility
+  random_seed: 42
+
+# Service Configuration
+services:
+  marketdata_gw:
+    enabled: true
+    buffer_size: 1000
+
+  features_svc:
+    enabled: true
+
+  volflow_estimator:
+    enabled: true
+
+  as_engine:
+    enabled: true
+
+  order_router:
+    enabled: true
+    batch_size: 10
+
+  inventory_svc:
+    enabled: true
+
+  risk_manager:
+    enabled: true
+
+  metrics_svc:
+    enabled: true
+
+  sim_backtest:
+    enabled: false
+
+# Logging Configuration
+logging:
+  version: 1
+  disable_existing_loggers: false
+  formatters:
+    json:
+      class: pythonjsonlogger.jsonlogger.JsonFormatter
+      format: "%(timestamp)s %(name)s %(level)s %(message)s"
+    console:
+      format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  handlers:
+    console:
+      class: logging.StreamHandler
+      level: DEBUG
+      formatter: console
+      stream: ext://sys.stdout
+    file:
+      class: logging.handlers.RotatingFileHandler
+      level: DEBUG
+      formatter: json
+      filename: logs/marketmaker.log
+      maxBytes: 10485760
+      backupCount: 10
+  loggers:
+    shared:
+      level: DEBUG
+      handlers: [console, file]
+    services:
+      level: DEBUG
+      handlers: [console, file]
+  root:
+    level: DEBUG
+    handlers: [console, file]
