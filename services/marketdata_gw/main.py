@@ -2,19 +2,238 @@
 Market Data Gateway Service.
 Ingests WebSocket data from Binance and publishes to NATS.
 
-Phase 1: Infrastructure scaffold - no actual Binance connection yet.
+Phase 2: Binance WebSocket ingestion with depth and trade streams.
 """
 
 import asyncio
 import signal
 import sys
-from typing import Optional
+import json
+import time
+from typing import Optional, Dict, Any
+
+import websockets
 
 from shared.nats_client import NATSClient
 from shared.config import load_config
 from shared.logger import setup_logging, get_logger
+from shared.schemas import DepthSnapshot, TradeMessage
 
 logger: Optional[object] = None
+
+
+class BinanceWebSocketManager:
+    """Manager for Binance WebSocket streams."""
+
+    def __init__(self, config, on_depth_callback, on_trade_callback):
+        """
+        Initialize Binance WebSocket manager.
+
+        Args:
+            config: Configuration object.
+            on_depth_callback: Async callback for depth messages.
+            on_trade_callback: Async callback for trade messages.
+        """
+        self.config = config
+        self.on_depth_callback = on_depth_callback
+        self.on_trade_callback = on_trade_callback
+        self.symbol = config.system.symbol.lower()
+
+        # Determine WS URL based on testnet setting
+        if config.binance.testnet:
+            self.ws_base_url = "wss://stream.binancefuture.com"
+        else:
+            self.ws_base_url = "wss://fstream.binance.com"
+
+        self._running = False
+        self._ws_depth = None
+        self._ws_trades = None
+        self._reconnect_delay = 1  # Start with 1s backoff
+        self._max_reconnect_delay = 30
+        self._errors = 0
+
+    async def start(self) -> None:
+        """Start WebSocket streams."""
+        logger.info("Starting Binance WebSocket streams")
+        self._running = True
+
+        # Start both streams concurrently
+        depth_task = asyncio.create_task(self._stream_depth())
+        trades_task = asyncio.create_task(self._stream_trades())
+
+        # Wait for both (they run until _running is False)
+        await asyncio.gather(depth_task, trades_task)
+
+    async def stop(self) -> None:
+        """Stop WebSocket streams."""
+        logger.info("Stopping Binance WebSocket streams")
+        self._running = False
+
+        if self._ws_depth:
+            await self._ws_depth.close()
+        if self._ws_trades:
+            await self._ws_trades.close()
+
+    async def _stream_depth(self) -> None:
+        """Subscribe to depth stream with auto-reconnect."""
+        while self._running:
+            try:
+                # Format: symbol@depth<levels>@<speed>
+                # 100ms updates, 20 levels
+                stream_name = f"{self.symbol}@depth20@100ms"
+                ws_url = f"{self.ws_base_url}/ws/{stream_name}"
+
+                logger.info("Connecting to depth stream", url=ws_url)
+
+                async with websockets.connect(ws_url, ping_interval=None) as ws:
+                    self._ws_depth = ws
+                    self._reconnect_delay = 1  # Reset on successful connect
+
+                    async for message in ws:
+                        if not self._running:
+                            break
+
+                        try:
+                            data = json.loads(message)
+                            await self._process_depth_message(data)
+                        except json.JSONDecodeError:
+                            logger.error("Failed to decode depth message", raw=message)
+                            self._errors += 1
+                        except Exception as e:
+                            logger.error("Error processing depth message", error=str(e))
+                            self._errors += 1
+
+            except asyncio.CancelledError:
+                logger.info("Depth stream task cancelled")
+                break
+            except Exception as e:
+                logger.warning(
+                    "Depth stream error, reconnecting",
+                    error=str(e),
+                    delay_sec=self._reconnect_delay
+                )
+                await asyncio.sleep(self._reconnect_delay)
+                self._reconnect_delay = min(self._reconnect_delay * 2, self._max_reconnect_delay)
+
+    async def _stream_trades(self) -> None:
+        """Subscribe to trades stream with auto-reconnect."""
+        while self._running:
+            try:
+                # Format: symbol@aggTrade
+                stream_name = f"{self.symbol}@aggTrade"
+                ws_url = f"{self.ws_base_url}/ws/{stream_name}"
+
+                logger.info("Connecting to trades stream", url=ws_url)
+
+                async with websockets.connect(ws_url, ping_interval=None) as ws:
+                    self._ws_trades = ws
+                    self._reconnect_delay = 1  # Reset on successful connect
+
+                    async for message in ws:
+                        if not self._running:
+                            break
+
+                        try:
+                            data = json.loads(message)
+                            await self._process_trade_message(data)
+                        except json.JSONDecodeError:
+                            logger.error("Failed to decode trade message", raw=message)
+                            self._errors += 1
+                        except Exception as e:
+                            logger.error("Error processing trade message", error=str(e))
+                            self._errors += 1
+
+            except asyncio.CancelledError:
+                logger.info("Trades stream task cancelled")
+                break
+            except Exception as e:
+                logger.warning(
+                    "Trades stream error, reconnecting",
+                    error=str(e),
+                    delay_sec=self._reconnect_delay
+                )
+                await asyncio.sleep(self._reconnect_delay)
+                self._reconnect_delay = min(self._reconnect_delay * 2, self._max_reconnect_delay)
+
+    async def _process_depth_message(self, data: Dict[str, Any]) -> None:
+        """Process depth snapshot from Binance."""
+        try:
+            # Binance depth format:
+            # {
+            #   "e": "depthUpdate",
+            #   "E": 1234567890,
+            #   "s": "BTCUSDT",
+            #   "U": 157,
+            #   "u": 160,
+            #   "b": [["0.0024", "10"]],     # bids
+            #   "a": [["0.0026", "100"]]     # asks
+            # }
+
+            if data.get("e") != "depthUpdate":
+                return  # Not a depth message
+
+            timestamp_ms = int(time.time() * 1000)
+            exchange_timestamp_ms = data.get("E", timestamp_ms)
+
+            # Parse bids and asks as floats
+            bids = [(float(price), float(qty)) for price, qty in data.get("b", [])]
+            asks = [(float(price), float(qty)) for price, qty in data.get("a", [])]
+
+            # Create depth snapshot
+            depth = DepthSnapshot(
+                symbol=self.symbol.upper(),
+                timestamp_ms=timestamp_ms,
+                exchange_timestamp_ms=exchange_timestamp_ms,
+                bids=bids,
+                asks=asks,
+            )
+
+            # Send to callback
+            await self.on_depth_callback(depth)
+
+        except Exception as e:
+            logger.error("Failed to process depth message", error=str(e), data=data)
+            raise
+
+    async def _process_trade_message(self, data: Dict[str, Any]) -> None:
+        """Process trade message from Binance."""
+        try:
+            # Binance aggTrade format:
+            # {
+            #   "e": "aggTrade",
+            #   "E": 123456789,
+            #   "s": "BNBBTC",
+            #   "a": 12345,
+            #   "p": "0.001",
+            #   "q": "100",
+            #   "f": 100,
+            #   "l": 105,
+            #   "T": 123456785,
+            #   "m": true,
+            #   "M": true
+            # }
+
+            if data.get("e") != "aggTrade":
+                return  # Not a trade message
+
+            timestamp_ms = data.get("E", int(time.time() * 1000))
+
+            # Create trade message
+            trade = TradeMessage(
+                symbol=self.symbol.upper(),
+                timestamp_ms=timestamp_ms,
+                trade_id=data.get("a", 0),
+                price=float(data.get("p", 0)),
+                quantity=float(data.get("q", 0)),
+                is_buyer_maker=data.get("m", False),
+            )
+
+            # Send to callback
+            await self.on_trade_callback(trade)
+
+        except Exception as e:
+            logger.error("Failed to process trade message", error=str(e), data=data)
+            raise
 
 
 class MarketDataGateway:
@@ -28,6 +247,33 @@ class MarketDataGateway:
         self._messages_published = 0
         self._errors = 0
 
+        # Create WebSocket manager
+        self.ws_manager = BinanceWebSocketManager(
+            config,
+            self.on_depth,
+            self.on_trade
+        )
+
+    async def on_depth(self, depth: DepthSnapshot) -> None:
+        """Handle depth snapshot."""
+        try:
+            await self.nats.publish("raw.depth.v1", depth)
+            self._messages_published += 1
+            logger.debug("Published depth message", published=self._messages_published)
+        except Exception as e:
+            logger.error("Failed to publish depth message", error=str(e))
+            self._errors += 1
+
+    async def on_trade(self, trade: TradeMessage) -> None:
+        """Handle trade message."""
+        try:
+            await self.nats.publish("raw.trades.v1", trade)
+            self._messages_published += 1
+            logger.debug("Published trade message", published=self._messages_published)
+        except Exception as e:
+            logger.error("Failed to publish trade message", error=str(e))
+            self._errors += 1
+
     async def start(self) -> None:
         """Start service."""
         logger.info("Starting MarketDataGateway service")
@@ -35,10 +281,6 @@ class MarketDataGateway:
             await self.nats.connect()
             self._running = True
             logger.info("MarketDataGateway ready")
-
-            # Phase 1: Just wait for shutdown
-            # Phase 2: Connect to Binance WebSocket
-            # Phase 3: Publish market data to NATS
 
         except Exception as e:
             logger.error("Failed to start MarketDataGateway", error=str(e))
@@ -48,17 +290,21 @@ class MarketDataGateway:
         """Stop service."""
         logger.info("Stopping MarketDataGateway service")
         self._running = False
+        await self.ws_manager.stop()
         await self.nats.close()
-        logger.info("MarketDataGateway stopped")
+        logger.info(
+            "MarketDataGateway stopped",
+            messages_published=self._messages_published,
+            errors=self._errors,
+        )
 
     async def run(self) -> None:
         """Main service loop."""
         try:
             await self.start()
 
-            # Phase 1: Just wait for shutdown signal
-            while self._running:
-                await asyncio.sleep(1)
+            # Run WebSocket manager
+            await self.ws_manager.start()
 
         except asyncio.CancelledError:
             logger.info("Service cancelled")
