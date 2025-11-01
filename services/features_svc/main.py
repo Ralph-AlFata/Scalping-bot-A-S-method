@@ -56,6 +56,10 @@ class FeatureCalculator:
         self.ofi_history: Deque[float] = deque(maxlen=self.ofi_window)
         self.micro_price_ema: Optional[float] = None
 
+        # OFI calculation state - store depth snapshots for delta calculation
+        self.depth_history: Deque[DepthSnapshot] = deque(maxlen=self.ofi_window + 1)
+        self.last_mid_price: Optional[float] = None
+
     def calculate_features(self, depth: DepthSnapshot) -> Optional[FeatureMessage]:
         """
         Calculate all features from depth snapshot.
@@ -78,8 +82,11 @@ class FeatureCalculator:
             # Calculate mid price
             mid_price = (best_bid + best_ask) / 2.0
 
+            # Store depth snapshot for OFI calculation
+            self.depth_history.append(depth)
+
             # Calculate OFI
-            ofi_value = self._calculate_ofi(depth)
+            ofi_value = self._calculate_ofi(depth, mid_price)
             self.ofi_history.append(ofi_value)
 
             # Calculate OFI z-score
@@ -93,6 +100,9 @@ class FeatureCalculator:
                 z_score=ofi_z_score,
                 direction=ofi_direction,
             )
+
+            # Update last mid price for next iteration
+            self.last_mid_price = mid_price
 
             # Calculate micro price (volume-weighted mid)
             micro_price = self._calculate_micro_price(best_bid, best_bid_qty, best_ask, best_ask_qty)
@@ -134,15 +144,75 @@ class FeatureCalculator:
             logger.error("Error calculating features", error=str(e))
             return None
 
-    def _calculate_ofi(self, depth: DepthSnapshot) -> float:
+    def _calculate_ofi(self, depth: DepthSnapshot, mid_price: float) -> float:
         """
-        Calculate Order Flow Imbalance (OFI).
+        Calculate Order Flow Imbalance (OFI) using the correct formula:
 
-        OFI = sum(bid volumes) - sum(ask volumes) at current depth.
+        OFI_t = Σ(i=t-w to t) sign(Δp_i) × ΔV_i
+
+        where:
+        - w = lookback window (typically 1-5 seconds)
+        - sign(Δp_i) = direction of price change (+1 for up, -1 for down, 0 for no change)
+        - ΔV_i = change in volume at each price level
+
+        This implementation calculates the instantaneous OFI contribution for the current tick,
+        and the rolling sum is maintained in self.ofi_history.
         """
-        bid_volume = sum(qty for _, qty in depth.bids)
-        ask_volume = sum(qty for _, qty in depth.asks)
-        return bid_volume - ask_volume
+        # Need at least 2 snapshots to calculate deltas
+        if len(self.depth_history) < 2 or self.last_mid_price is None:
+            return 0.0
+
+        try:
+            # Get previous depth snapshot
+            prev_depth = self.depth_history[-2]
+            curr_depth = depth
+
+            # Calculate price change direction: sign(Δp)
+            delta_price = mid_price - self.last_mid_price
+
+            if abs(delta_price) < 1e-10:  # No significant price change
+                price_sign = 0.0
+            elif delta_price > 0:
+                price_sign = 1.0
+            else:
+                price_sign = -1.0
+
+            # Calculate volume change: ΔV
+            # We'll focus on the volume changes at the best bid and ask levels
+            # as a proxy for order flow imbalance
+
+            # Convert order book to dictionaries for easier lookup
+            prev_bid_dict = {price: qty for price, qty in prev_depth.bids[:10]}  # Top 10 levels
+            prev_ask_dict = {price: qty for price, qty in prev_depth.asks[:10]}
+
+            curr_bid_dict = {price: qty for price, qty in curr_depth.bids[:10]}
+            curr_ask_dict = {price: qty for price, qty in curr_depth.asks[:10]}
+
+            # Calculate volume deltas at each price level
+            delta_volume = 0.0
+
+            # Check bid side volume changes
+            all_bid_prices = set(prev_bid_dict.keys()) | set(curr_bid_dict.keys())
+            for price in all_bid_prices:
+                prev_qty = prev_bid_dict.get(price, 0.0)
+                curr_qty = curr_bid_dict.get(price, 0.0)
+                delta_volume += (curr_qty - prev_qty)
+
+            # Check ask side volume changes (subtract because it's supply)
+            all_ask_prices = set(prev_ask_dict.keys()) | set(curr_ask_dict.keys())
+            for price in all_ask_prices:
+                prev_qty = prev_ask_dict.get(price, 0.0)
+                curr_qty = curr_ask_dict.get(price, 0.0)
+                delta_volume -= (curr_qty - prev_qty)
+
+            # OFI = sign(Δp) × ΔV
+            ofi_instant = price_sign * delta_volume
+
+            return ofi_instant
+
+        except Exception as e:
+            logger.error("Error calculating OFI", error=str(e))
+            return 0.0
 
     def _calculate_micro_price(self, best_bid: float, best_bid_qty: float, best_ask: float, best_ask_qty: float) -> float:
         """

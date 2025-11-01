@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
+from dotenv import load_dotenv
 
 
 def substitute_env_vars(value: Any) -> Any:
@@ -67,6 +68,9 @@ class Config:
         Raises:
             FileNotFoundError: If config file not found.
         """
+        # Load environment variables from .env file
+        load_dotenv()
+
         if path is None:
             path = "./config.yaml"
 
