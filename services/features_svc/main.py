@@ -53,11 +53,13 @@ class FeatureCalculator:
 
         # State
         self.last_depth: Optional[DepthSnapshot] = None
-        self.ofi_history: Deque[float] = deque(maxlen=self.ofi_window)
         self.micro_price_ema: Optional[float] = None
 
         # OFI calculation state - store depth snapshots for delta calculation
         self.depth_history: Deque[DepthSnapshot] = deque(maxlen=self.ofi_window + 1)
+        self.ofi_contributions: Deque[float] = deque(maxlen=self.ofi_window)  # Individual tick OFI contributions
+        self.ofi_cumulative: float = 0.0  # Rolling sum of OFI contributions
+        self.ofi_cumulative_history: Deque[float] = deque(maxlen=100)  # History of cumulative OFI for z-score
         self.last_mid_price: Optional[float] = None
 
     def calculate_features(self, depth: DepthSnapshot) -> Optional[FeatureMessage]:
@@ -85,18 +87,30 @@ class FeatureCalculator:
             # Store depth snapshot for OFI calculation
             self.depth_history.append(depth)
 
-            # Calculate OFI
-            ofi_value = self._calculate_ofi(depth, mid_price)
-            self.ofi_history.append(ofi_value)
+            # Calculate instantaneous OFI contribution (for this tick)
+            ofi_contribution = self._calculate_ofi_contribution(depth, mid_price)
 
-            # Calculate OFI z-score
-            ofi_z_score = self._calculate_z_score(list(self.ofi_history))
+            # Update cumulative rolling OFI
+            # If we're at window capacity, subtract the oldest contribution
+            if len(self.ofi_contributions) == self.ofi_window:
+                self.ofi_cumulative -= self.ofi_contributions[0]
+
+            # Add new contribution
+            # If the queue is full, the queue.append() function automatically removes the first element and adds that item as the last one
+            self.ofi_contributions.append(ofi_contribution)
+            self.ofi_cumulative += ofi_contribution
+
+            # Store cumulative OFI in history for z-score calculation
+            self.ofi_cumulative_history.append(self.ofi_cumulative)
+
+            # Calculate OFI z-score from cumulative history
+            ofi_z_score = self._calculate_z_score(list(self.ofi_cumulative_history))
             ofi_direction = None
             if abs(ofi_z_score) > self.ofi_threshold:
                 ofi_direction = "BUY" if ofi_z_score > 0 else "SELL"
 
             ofi_data = OFIData(
-                value=ofi_value,
+                value=self.ofi_cumulative,  # Use cumulative OFI as the value
                 z_score=ofi_z_score,
                 direction=ofi_direction,
             )
@@ -144,19 +158,25 @@ class FeatureCalculator:
             logger.error("Error calculating features", error=str(e))
             return None
 
-    def _calculate_ofi(self, depth: DepthSnapshot, mid_price: float) -> float:
+    def _calculate_ofi_contribution(self, depth: DepthSnapshot, mid_price: float) -> float:
         """
-        Calculate Order Flow Imbalance (OFI) using the correct formula:
+        Calculate instantaneous Order Flow Imbalance (OFI) contribution for a single tick.
 
-        OFI_t = Σ(i=t-w to t) sign(Δp_i) × ΔV_i
+        OFI_contribution_t = sign(Δp_t) × ΔV_t
 
         where:
-        - w = lookback window (typically 1-5 seconds)
-        - sign(Δp_i) = direction of price change (+1 for up, -1 for down, 0 for no change)
-        - ΔV_i = change in volume at each price level
+        - sign(Δp_t) = direction of price change from t-1 to t (+1 for up, -1 for down, 0 for no change)
+        - ΔV_t = change in volume at each price level from t-1 to t
 
-        This implementation calculates the instantaneous OFI contribution for the current tick,
-        and the rolling sum is maintained in self.ofi_history.
+        The rolling cumulative OFI is calculated by summing these contributions over a window:
+        OFI_t = Σ(i=t-w to t) OFI_contribution_i
+
+        Args:
+            depth: Current depth snapshot
+            mid_price: Current mid-price
+
+        Returns:
+            Instantaneous OFI contribution for this tick
         """
         # Need at least 2 snapshots to calculate deltas
         if len(self.depth_history) < 2 or self.last_mid_price is None:
@@ -205,13 +225,13 @@ class FeatureCalculator:
                 curr_qty = curr_ask_dict.get(price, 0.0)
                 delta_volume -= (curr_qty - prev_qty)
 
-            # OFI = sign(Δp) × ΔV
-            ofi_instant = price_sign * delta_volume
+            # OFI contribution = sign(Δp) × ΔV
+            ofi_contribution = price_sign * delta_volume
 
-            return ofi_instant
+            return ofi_contribution
 
         except Exception as e:
-            logger.error("Error calculating OFI", error=str(e))
+            logger.error("Error calculating OFI contribution", error=str(e))
             return 0.0
 
     def _calculate_micro_price(self, best_bid: float, best_bid_qty: float, best_ask: float, best_ask_qty: float) -> float:
