@@ -3,6 +3,23 @@ Features Service.
 Calculates order flow imbalance (OFI), micro-price, and queue imbalance.
 
 Phase 2: OFI, micro-price, queue imbalance calculation and publishing.
+
+Purpose: Calculate market microstructure features from raw market data.
+
+Responsibilities:
+    - Calculate micro-price (volume-weighted mid-price)
+    - Compute order flow imbalance (OFI) over rolling windows
+    - Calculate queue imbalance at best bid/ask
+    - Compute z-scores for normalization
+    - Maintain rolling buffers for calculations
+    - Publish feature vectors
+
+Inputs (NATS Subscriptions):
+    - raw.depth.v1 - Order book snapshots
+    - raw.trades.v1 - Trade events
+
+Outputs (NATS Topics):
+    - features.v1 - Feature vectors
 """
 
 import asyncio

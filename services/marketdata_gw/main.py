@@ -3,6 +3,25 @@ Market Data Gateway Service.
 Ingests WebSocket data from Binance and publishes to NATS.
 
 Phase 2: Binance WebSocket ingestion with depth and trade streams.
+
+Purpose: Ingest real-time market data from Binance Futures WebSocket API.
+
+Responsibilities:
+    - Establish and maintain WebSocket connections to Binance
+    - Subscribe to order book depth streams (100ms snapshots)
+    - Subscribe to aggregated trade streams
+    - Parse and normalize incoming messages
+    - Publish standardized events to NATS topics
+    - Handle reconnection on connection loss
+    - Monitor connection health
+
+Inputs:
+    Binance WebSocket streams:
+        - btcusdt@depth@100ms (order book L2)
+        - btcusdt@aggTrade (aggregated trades)
+Outputs (NATS Topics):
+    - raw.depth.v1 - Order book snapshots
+    - raw.trades.v1 - Trade events
 """
 
 import asyncio
