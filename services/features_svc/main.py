@@ -50,6 +50,7 @@ class FeatureCalculator:
         self.ofi_threshold = config.strategy.features.ofi_z_score_threshold
         self.queue_depth = config.strategy.features.queue_imbalance_depth
         self.micro_price_alpha = config.strategy.features.micro_price_alpha
+        self.ofi_depth_levels = config.strategy.features.get("ofi_depth_levels", 10)  # Depth for OFI volume calculation
 
         # State
         self.last_depth: Optional[DepthSnapshot] = None
@@ -61,6 +62,11 @@ class FeatureCalculator:
         self.ofi_cumulative: float = 0.0  # Rolling sum of OFI contributions
         self.ofi_cumulative_history: Deque[float] = deque(maxlen=100)  # History of cumulative OFI for z-score
         self.last_mid_price: Optional[float] = None
+
+        # OFI direction hysteresis - prevent rapid flips
+        self.last_ofi_direction: Optional[str] = None
+        self.direction_confirmation_count: int = 0
+        self.direction_confirmation_threshold: int = 2  # Require 2 consecutive signals to change direction
 
     def calculate_features(self, depth: DepthSnapshot) -> Optional[FeatureMessage]:
         """
@@ -105,9 +111,9 @@ class FeatureCalculator:
 
             # Calculate OFI z-score from cumulative history
             ofi_z_score = self._calculate_z_score(list(self.ofi_cumulative_history))
-            ofi_direction = None
-            if abs(ofi_z_score) > self.ofi_threshold:
-                ofi_direction = "BUY" if ofi_z_score > 0 else "SELL"
+
+            # Determine OFI direction with hysteresis to prevent rapid flips
+            ofi_direction = self._calculate_ofi_direction_with_hysteresis(ofi_z_score)
 
             ofi_data = OFIData(
                 value=self.ofi_cumulative,  # Use cumulative OFI as the value
@@ -198,15 +204,15 @@ class FeatureCalculator:
                 price_sign = -1.0
 
             # Calculate volume change: ΔV
-            # We'll focus on the volume changes at the best bid and ask levels
-            # as a proxy for order flow imbalance
+            # Use configurable depth levels for OFI calculation
+            depth_limit = self.ofi_depth_levels
 
             # Convert order book to dictionaries for easier lookup
-            prev_bid_dict = {price: qty for price, qty in prev_depth.bids[:10]}  # Top 10 levels
-            prev_ask_dict = {price: qty for price, qty in prev_depth.asks[:10]}
+            prev_bid_dict = {price: qty for price, qty in prev_depth.bids[:depth_limit]}
+            prev_ask_dict = {price: qty for price, qty in prev_depth.asks[:depth_limit]}
 
-            curr_bid_dict = {price: qty for price, qty in curr_depth.bids[:10]}
-            curr_ask_dict = {price: qty for price, qty in curr_depth.asks[:10]}
+            curr_bid_dict = {price: qty for price, qty in curr_depth.bids[:depth_limit]}
+            curr_ask_dict = {price: qty for price, qty in curr_depth.asks[:depth_limit]}
 
             # Calculate volume deltas at each price level
             delta_volume = 0.0
@@ -227,6 +233,14 @@ class FeatureCalculator:
 
             # OFI contribution = sign(Δp) × ΔV
             ofi_contribution = price_sign * delta_volume
+
+            logger.debug(
+                "OFI contribution calculated",
+                contribution=ofi_contribution,
+                price_sign=price_sign,
+                delta_volume=delta_volume,
+                delta_price=delta_price,
+            )
 
             return ofi_contribution
 
@@ -249,11 +263,12 @@ class FeatureCalculator:
         """
         Calculate queue imbalance at specific depth level.
 
-        Queue depth is calculated as the number of orders (or ticks) at each level.
+        Queue imbalance is calculated as the sum of volumes at the top queue_depth price levels.
+        This provides a measure of relative liquidity strength at each side of the book.
         """
-        # Count levels up to queue_depth
-        bid_queue = min(len(depth.bids), self.queue_depth)
-        ask_queue = min(len(depth.asks), self.queue_depth)
+        # Sum volumes at top queue_depth levels
+        bid_queue = sum(qty for _, qty in depth.bids[:self.queue_depth])
+        ask_queue = sum(qty for _, qty in depth.asks[:self.queue_depth])
 
         # Calculate imbalance ratio
         imbalance_ratio = bid_queue / ask_queue if ask_queue > 0 else 1.0
@@ -263,6 +278,54 @@ class FeatureCalculator:
             ask_queue=float(ask_queue),
             imbalance_ratio=imbalance_ratio,
         )
+
+    def _calculate_ofi_direction_with_hysteresis(self, ofi_z_score: float) -> Optional[str]:
+        """
+        Calculate OFI direction with hysteresis to prevent rapid flips.
+
+        Uses a confirmation threshold - requires direction to be consistent
+        for N consecutive ticks before changing the direction.
+
+        Args:
+            ofi_z_score: Current OFI z-score
+
+        Returns:
+            "BUY", "SELL", or None if no significant signal
+        """
+        # Determine what the raw direction signal would be
+        raw_direction = None
+        if abs(ofi_z_score) > self.ofi_threshold:
+            raw_direction = "BUY" if ofi_z_score > 0 else "SELL"
+
+        # If no raw signal, reset confirmation count and return last known direction
+        if raw_direction is None:
+            self.direction_confirmation_count = 0
+            return None
+
+        # If raw direction matches last confirmed direction, maintain it
+        if raw_direction == self.last_ofi_direction:
+            self.direction_confirmation_count += 1
+            return self.last_ofi_direction
+
+        # If raw direction is different, start counting confirmations
+        if raw_direction != self.last_ofi_direction:
+            self.direction_confirmation_count += 1
+
+            # Once we have enough confirmations, flip the direction
+            if self.direction_confirmation_count >= self.direction_confirmation_threshold:
+                self.last_ofi_direction = raw_direction
+                self.direction_confirmation_count = 0
+                logger.info(
+                    "OFI direction changed with hysteresis",
+                    new_direction=self.last_ofi_direction,
+                    z_score=ofi_z_score,
+                )
+                return self.last_ofi_direction
+
+            # Not enough confirmations yet, return old direction
+            return self.last_ofi_direction
+
+        return None
 
     def _calculate_z_score(self, values: List[float]) -> float:
         """Calculate z-score of the last value in the list."""

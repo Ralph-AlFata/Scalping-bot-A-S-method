@@ -49,8 +49,9 @@ strategy:
   features:
     ofi_window_ticks: 50              # Ticks for OFI calculation
     ofi_z_score_threshold: 1.5        # Z-score threshold for OFI signal
+    ofi_depth_levels: 10              # Depth levels for OFI volume calculation
     micro_price_alpha: 0.5            # Micro-price moving average (0.0 to 1.0)
-    queue_imbalance_depth: 10         # Depth levels for queue imbalance
+    queue_imbalance_depth: 10         # Depth levels for queue imbalance (now volume-based)
 
   # Volatility and Order Intensity
   volflow:

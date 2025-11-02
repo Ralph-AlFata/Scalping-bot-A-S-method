@@ -31,7 +31,15 @@ def substitute_env_vars(value: Any) -> Any:
             return os.getenv(var_name, match.group(0))
 
         import re
-        return re.sub(r"\$\{([^}]+)\}", replace_var, value)
+        result = re.sub(r"\$\{([^}]+)\}", replace_var, value)
+
+        # Convert string booleans to actual booleans
+        if result.lower() == "true":
+            return True
+        elif result.lower() == "false":
+            return False
+
+        return result
 
     elif isinstance(value, dict):
         return {k: substitute_env_vars(v) for k, v in value.items()}
