@@ -72,7 +72,22 @@ class VolatilityEstimate:
 
 
 class VolflowCalculator:
-    """Calculates volatility, order intensity, and VPIN with multi-scale estimation."""
+    """
+    Calculates volatility, order intensity, and VPIN with multi-scale estimation.
+
+    UNIT SYSTEM - ALL VOLATILITY IN PER-SECOND:
+    ============================================
+    All volatility estimates (EWMA, RV, TSRV, HAR, Yang-Zhang) return per-second
+    volatility (σ) for consistency across the entire system. This allows direct
+    comparison and blending of different estimation methods without unit conversion.
+
+    Example: σ = 0.001 means 0.1% volatility per second
+             In 1 minute (60 seconds): σ_minute = 0.001 * sqrt(60) ≈ 0.0077
+             In 1 hour (3600 seconds): σ_hour = 0.001 * sqrt(3600) ≈ 0.06
+
+    Lookback windows differ by method (e.g., EWMA uses exponential decay, RV uses
+    2-hour window) but all are normalized to the same per-second unit.
+    """
 
     def __init__(self, config):
         """Initialize volatility calculator."""
@@ -180,6 +195,9 @@ class VolflowCalculator:
         is_buy_aggressor = not trade.is_buyer_maker
         self._update_volume_bucket(trade.quantity, is_buy_aggressor)
 
+        # Update OHLC buckets for Yang-Zhang volatility estimator
+        self._update_ohlc_buckets(timestamp, trade.price, trade.quantity)
+
         # Cleanup old data
         self._cleanup_old_data(timestamp)
         self._cleanup_old_market_trades(timestamp)
@@ -245,10 +263,14 @@ class VolflowCalculator:
         """
         Calculate per-second realized volatility using multi-scale estimation.
 
-        Implements: EWMA (ultra-responsive), RV (accurate), TSRV (noise-robust),
-        HAR (forward-looking), and Yang-Zhang (full OHLC).
+        All estimators return CONSISTENT per-second units (σ):
+        - EWMA: Per-second volatility, exponentially weighted by time
+        - RV: Per-second volatility over 2-hour window with 5-min buckets
+        - TSRV: Per-second volatility, noise-corrected over 20-minute window
+        - HAR: Per-second volatility forecast from multi-horizon components
+        - Yang-Zhang: Per-second volatility from OHLC data
 
-        Returns the weighted aggregate of all available estimators.
+        Returns weighted aggregate of all available estimators with confidence metric.
         """
         current_time = time.time()
 
@@ -336,8 +358,9 @@ class VolflowCalculator:
         self.last_update_time = timestamp
         self.rv_current_period_start = timestamp
 
-        seconds_per_trading_year = 252 * 24 * 3600
-        self.sigma_squared = (self.vol_min ** 2) / seconds_per_trading_year
+        # Initialize sigma_squared as per-second variance (not annualized)
+        # Start at vol_min to avoid extremely small initial values
+        self.sigma_squared = self.vol_min ** 2
         self.sigma_squared_fast = self.sigma_squared
 
     def _update_rv_buckets(self, log_return: float, timestamp: float) -> None:
@@ -366,10 +389,12 @@ class VolflowCalculator:
 
     def _calculate_ewma_volatility(self) -> float:
         """
-        Calculate EWMA volatility with time normalization.
+        Calculate EWMA per-second volatility with time normalization.
 
         Uses optimized lambda (0.88) for short-horizon crypto trading
         instead of RiskMetrics 0.94.
+
+        Returns: Per-second volatility (σ)
         """
         if self.last_price is None or len(self.trade_prices) < 2:
             return self.vol_min
@@ -382,9 +407,10 @@ class VolflowCalculator:
                 return self.vol_min
 
             log_return = math.log(latest_price / self.last_price)
+            # Normalize return to per-second basis
             normalized_return = log_return / math.sqrt(dt_seconds)
 
-            # EWMA update: σ²ₜ = λσ²ₜ₋₁ + (1-λ)r²ₜ
+            # EWMA update: σ²ₜ = λσ²ₜ₋₁ + (1-λ)r²ₜ (per-second variance)
             self.sigma_squared = (
                 self.decay_lambda * self.sigma_squared +
                 (1 - self.decay_lambda) * (normalized_return ** 2)
@@ -404,11 +430,15 @@ class VolflowCalculator:
 
     def _calculate_realized_volatility(self) -> Optional[float]:
         """
-        Calculate 5-minute realized volatility.
+        Calculate per-second realized volatility over recent 2-hour window.
 
-        Uses: RV = sqrt(sum of squared 5-minute returns / time_period)
-        Sampling at 5-minute intervals avoids microstructure noise issues
-        while capturing high-frequency information.
+        Uses 5-minute buckets to avoid microstructure noise while capturing
+        actual volatility in the recent trading period.
+
+        Formula: RV = sqrt(sum(r²_i) / num_seconds)
+        where r²_i = squared log returns in each 5-minute period
+
+        Returns: Per-second volatility (σ)
         """
         if len(self.rv_5min_periods) < 2:
             return None
@@ -418,13 +448,11 @@ class VolflowCalculator:
             recent_rv = list(self.rv_5min_periods)[-24:]
             total_rv = sum(recent_rv)
 
-            # Time normalization: 24 periods of 5 minutes = 120 minutes = 2 hours
-            time_hours = len(recent_rv) * 5 / 60
-            seconds_per_year = 252 * 24 * 3600
-            time_fraction = time_hours / (252 * 24)
+            # Convert to per-second volatility
+            # Each 5-minute period = 300 seconds
+            num_seconds = len(recent_rv) * 300  # 24 * 300 = 7200 seconds (2 hours)
+            rv_volatility = math.sqrt(total_rv / num_seconds)
 
-            # Convert to annualized per-second volatility
-            rv_volatility = math.sqrt(total_rv / time_fraction)
             return max(self.vol_min, min(rv_volatility, self.vol_max))
 
         except Exception:
@@ -432,22 +460,24 @@ class VolflowCalculator:
 
     def _calculate_tsrv_volatility(self) -> Optional[float]:
         """
-        Calculate Two-Scale Realized Volatility (TSRV).
+        Calculate Two-Scale Realized Volatility (TSRV) - per-second.
 
         Robust to microstructure noise by using high-frequency and low-frequency
         samples to estimate and correct for noise contamination.
 
-        TSRV = RV_low - (noise_correction)
+        TSRV = sqrt((RV_low - noise_correction) / num_seconds)
+
+        Returns: Per-second volatility (σ)
         """
         if len(self.tsrv_high_freq_returns) < 100 or len(self.rv_5min_periods) < 5:
             return None
 
         try:
-            # High-frequency RV (every 1.2 seconds)
-            rv_high = sum(list(self.tsrv_high_freq_returns)[-1000:])  # ~20 minutes
+            # High-frequency RV (sum of squared returns over ~20 minutes)
+            rv_high = sum(list(self.tsrv_high_freq_returns)[-1000:])  # ~1000 samples
 
-            # Low-frequency RV (5-minute periods)
-            rv_low = sum(list(self.rv_5min_periods)[-4:])  # ~20 minutes
+            # Low-frequency RV (sum of 4 five-minute periods = 20 minutes)
+            rv_low = sum(list(self.rv_5min_periods)[-4:])
 
             n_high = min(1000, len(self.tsrv_high_freq_returns))
             n_low = min(4, len(self.rv_5min_periods))
@@ -458,14 +488,14 @@ class VolflowCalculator:
             # Estimate noise variance
             noise_var = max(0, (rv_high - rv_low) / (n_high - n_low))
 
-            # TSRV with bias correction
+            # TSRV with bias correction (sum of squared returns)
             tsrv = max(0, rv_low - 2 * noise_var * n_low)
 
-            # Time normalization (20 minutes)
-            time_hours = 20 / 60
-            time_fraction = time_hours / (252 * 24)
+            # Convert to per-second volatility
+            # Window: 4 periods * 300 seconds/period = 1200 seconds (20 minutes)
+            num_seconds = 4 * 300
+            tsrv_volatility = math.sqrt(tsrv / num_seconds)
 
-            tsrv_volatility = math.sqrt(tsrv / time_fraction)
             return max(self.vol_min, min(tsrv_volatility, self.vol_max))
 
         except Exception:
@@ -473,12 +503,14 @@ class VolflowCalculator:
 
     def _calculate_har_forecast(self) -> Optional[float]:
         """
-        Calculate HAR (Heterogeneous Autoregressive) volatility forecast.
+        Calculate HAR (Heterogeneous Autoregressive) volatility forecast - per-second.
 
         HAR-RV: σ²_forecast = β₀ + β₁·RV_daily + β₂·RV_weekly + β₃·RV_monthly
 
         Captures multi-horizon volatility structure. Daily re-estimation of coefficients
         using 250 days of historical data.
+
+        Returns: Per-second volatility (σ)
         """
         if not self.har_enabled or len(self.rv_history) < 50:
             return None
@@ -496,16 +528,17 @@ class VolflowCalculator:
             # Calculate HAR components
             rv_hist = list(self.rv_history)
 
-            # Daily component (last 1 period with 5-min buckets = 5 minutes)
+            # Daily component (last 12 periods with 5-min buckets = 1 hour)
             rv_daily = np.mean(rv_hist[-12:]) if len(rv_hist) >= 12 else np.mean(rv_hist)
 
-            # Weekly component (last 5 periods = 25 minutes)
-            rv_weekly = np.mean(rv_hist[-60:]) if len(rv_hist) >= 60 else np.mean(rv_hist)
+            # Weekly component (last 144 periods = 12 hours, representing weekly in crypto)
+            rv_weekly = np.mean(rv_hist[-144:]) if len(rv_hist) >= 144 else np.mean(rv_hist)
 
-            # Monthly component (last 22 periods = 110 minutes)
-            rv_monthly = np.mean(rv_hist[-132:]) if len(rv_hist) >= 132 else np.mean(rv_hist)
+            # Monthly component (last 288 periods = 24 hours, representing monthly in crypto)
+            rv_monthly = np.mean(rv_hist[-288:]) if len(rv_hist) >= 288 else np.mean(rv_hist)
 
-            # HAR forecast
+            # HAR forecast: weighted average of squared returns at different horizons
+            # Each component is already per-second (normalized from rv_5min_periods)
             har_var = (
                 self.har_coefficients.get('beta_0', 0) +
                 self.har_coefficients.get('beta_d', 0.4) * rv_daily +
@@ -544,13 +577,15 @@ class VolflowCalculator:
 
     def _calculate_yang_zhang_volatility(self) -> Optional[float]:
         """
-        Calculate Yang-Zhang volatility estimator using OHLC data.
+        Calculate Yang-Zhang volatility estimator using OHLC data - per-second.
 
         YZ = sqrt(σ²_night + k·σ²_open-close + (1-k)·σ²_RS)
 
         More efficient than close-to-close (14x more efficient for GBM).
         Handles opening jumps better than standard estimators.
         Good for 24/7 crypto markets.
+
+        Returns: Per-second volatility (σ)
         """
         if len(self.ohlc_5min) < 3:
             return None
@@ -576,7 +611,11 @@ class VolflowCalculator:
                 total_yy_var += max(0, yy_component)
 
             avg_yy_var = total_yy_var / len(ohlc_data) if ohlc_data else 0
-            yy_vol = math.sqrt(max(0, avg_yy_var))
+
+            # Convert to per-second volatility
+            # Each OHLC period is 5 minutes = 300 seconds
+            num_seconds = 300
+            yy_vol = math.sqrt(max(0, avg_yy_var / num_seconds))
 
             return max(self.vol_min, min(yy_vol, self.vol_max))
 
@@ -618,30 +657,36 @@ class VolflowCalculator:
         """
         estimates = []
         weights = []
+        active_estimators = []
 
         # Always have EWMA
         estimates.append(ewma)
         weights.append(0.25)
+        active_estimators.append(f"EWMA={ewma:.6f}")
 
         # Add RV if available (primary backup)
         if rv is not None:
             estimates.append(rv)
             weights.append(0.35)
+            active_estimators.append(f"RV={rv:.6f}")
 
         # Add TSRV if available (noise-robust)
         if tsrv is not None:
             estimates.append(tsrv)
             weights.append(0.20)
+            active_estimators.append(f"TSRV={tsrv:.6f}")
 
         # Add HAR if available (forward-looking)
         if har is not None:
             estimates.append(har)
             weights.append(0.15)
+            active_estimators.append(f"HAR={har:.6f}")
 
         # Add Yang-Zhang if available
         if yy is not None:
             estimates.append(yy)
             weights.append(0.05)
+            active_estimators.append(f"YZ={yy:.6f}")
 
         # Normalize weights
         total_weight = sum(weights)
@@ -654,6 +699,15 @@ class VolflowCalculator:
         base_confidence = 0.5
         num_estimates = len(estimates)
         confidence = min(0.95, base_confidence + (num_estimates - 1) * 0.1)
+
+        # Log active estimators for debugging
+        logger.debug(
+            "Volatility estimation",
+            active_estimators=", ".join(active_estimators),
+            aggregated=f"{aggregated:.6f}",
+            confidence=f"{confidence:.2f}",
+            num_estimators=num_estimates
+        )
 
         return aggregated, confidence
 
@@ -738,10 +792,26 @@ class VolflowCalculator:
 
             # Bound k
             k = max(self.k_min, min(k_new, self.k_max))
+            k_bounded = k != k_new  # Check if k was capped
 
             # Confidence based on number of recent market trades (more reliable sample)
             recent_market_trades = sum(1 for t, _ in self.market_trades if t > current_time - self.k_window_sec)
             confidence = min(0.95, 0.3 + recent_market_trades / 100.0)  # Increased divisor since we get many trades
+
+            # Log order intensity details
+            logger.debug(
+                "Order intensity calculation",
+                market_trades_in_interval=market_trades_in_interval,
+                market_trade_rate=f"{market_trade_rate:.2f} trades/sec",
+                k_unbounded=f"{k_new:.2f}",
+                k_bounded=f"{k:.2f}",
+                was_capped=k_bounded,
+                k_min=self.k_min,
+                k_max=self.k_max,
+                recent_market_trades=recent_market_trades,
+                confidence=f"{confidence:.2f}",
+                fill_rate_ratio=f"{self.fill_rate_ratio:.3f}"
+            )
 
             return OrderIntensityData(k=k, confidence=confidence)
 
@@ -849,6 +919,95 @@ class VolflowCalculator:
 
             # Start new bucket
             self.current_bucket = {"buy_volume": 0.0, "sell_volume": 0.0}
+
+    def _update_ohlc_buckets(self, timestamp: float, price: float, volume: float) -> None:
+        """
+        Update OHLC buckets for Yang-Zhang volatility estimator.
+
+        Creates 1-minute and 5-minute OHLC bars from trade data.
+
+        Args:
+            timestamp: Trade timestamp in seconds
+            price: Trade price
+            volume: Trade volume
+        """
+        # Initialize current OHLC if needed
+        if self.current_ohlc is None:
+            self.current_ohlc = OHLC(
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=volume,
+                timestamp=timestamp
+            )
+            return
+
+        # Update current OHLC
+        self.current_ohlc.high = max(self.current_ohlc.high, price)
+        self.current_ohlc.low = min(self.current_ohlc.low, price)
+        self.current_ohlc.close = price
+        self.current_ohlc.volume += volume
+
+        # Check if we should complete current 1-minute bar
+        elapsed_1min = timestamp - self.current_ohlc.timestamp
+        if elapsed_1min >= 60.0:  # 1 minute
+            # Store completed 1-minute OHLC
+            self.ohlc_1min.append(self.current_ohlc)
+
+            logger.debug(
+                "Completed 1-minute OHLC bar",
+                ohlc_1min_count=len(self.ohlc_1min),
+                open=self.current_ohlc.open,
+                high=self.current_ohlc.high,
+                low=self.current_ohlc.low,
+                close=self.current_ohlc.close,
+                volume=self.current_ohlc.volume
+            )
+
+            # Start new OHLC bar
+            self.current_ohlc = OHLC(
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=volume,
+                timestamp=timestamp
+            )
+
+        # Check if we should complete current 5-minute bar
+        # Create 5-minute bars from 1-minute bars when we have 5 of them
+        if len(self.ohlc_1min) >= 5:
+            # Check if last 5 bars span at least 5 minutes
+            last_5_bars = list(self.ohlc_1min)[-5:]
+            time_span = last_5_bars[-1].timestamp - last_5_bars[0].timestamp
+
+            if time_span >= 300.0:  # 5 minutes
+                # Combine last 5 bars into 1 five-minute bar
+                ohlc_5min = OHLC(
+                    open=last_5_bars[0].open,
+                    high=max(bar.high for bar in last_5_bars),
+                    low=min(bar.low for bar in last_5_bars),
+                    close=last_5_bars[-1].close,
+                    volume=sum(bar.volume for bar in last_5_bars),
+                    timestamp=last_5_bars[0].timestamp
+                )
+                self.ohlc_5min.append(ohlc_5min)
+
+                logger.debug(
+                    "Completed 5-minute OHLC bar",
+                    ohlc_5min_count=len(self.ohlc_5min),
+                    open=ohlc_5min.open,
+                    high=ohlc_5min.high,
+                    low=ohlc_5min.low,
+                    close=ohlc_5min.close,
+                    volume=ohlc_5min.volume
+                )
+
+                # Remove the bars we just aggregated
+                for _ in range(5):
+                    if len(self.ohlc_1min) > 0:
+                        self.ohlc_1min.popleft()
 
     def _cleanup_old_data(self, current_time: float) -> None:
         """Remove data older than the maximum lookback window."""

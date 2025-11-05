@@ -78,7 +78,7 @@ strategy:
     # Order intensity settings
     order_intensity_window_sec: 60    # Order intensity lookback window
     order_intensity_k_min: 0.1        # Minimum k parameter
-    order_intensity_k_max: 10.0       # Maximum k parameter
+    order_intensity_k_max: 50.0       # Maximum k parameter (BTCUSDT can see 30-50+ trades/sec during active periods)
 
     # VPIN thresholds
     vpin_threshold_normal: 0.4        # VPIN below this is normal
