@@ -55,14 +55,32 @@ strategy:
 
   # Volatility and Order Intensity
   volflow:
+    # Volatility calculation settings
     volatility_lookback_sec: 60       # Volatility window (seconds)
     volatility_min: 0.0005            # Minimum volatility (prevents division by zero)
     volatility_max: 1.0               # Maximum volatility cap
+    # NOTE: Volatility is calculated as multi-scale estimation combining:
+    # - EWMA: Fast, responsive to recent trades (weight: 0.25)
+    # - RV: 5-minute realized volatility, accurate and robust (weight: 0.35)
+    # - TSRV: Two-scale RV, robust to microstructure noise (weight: 0.20)
+    # - HAR: Multi-horizon forecast for predictive power (weight: 0.15)
+    # - Yang-Zhang: OHLC-based, efficient estimator (weight: 0.05)
+    # The AS engine combines this with time_horizon to compute inventory adjustment:
+    # inventory_adj = inventory_qty * gamma * (volatility^2) * time_horizon
 
+    # EWMA configuration (optimized for short horizons)
+    ewma_lambda: 0.88                 # Decay factor for EWMA (0.88-0.90 for crypto short horizons)
+
+    # HAR model configuration
+    har_enabled: true                 # Enable HAR forecasting
+    har_lookback_days: 250            # Historical lookback for HAR coefficient estimation
+
+    # Order intensity settings
     order_intensity_window_sec: 60    # Order intensity lookback window
     order_intensity_k_min: 0.1        # Minimum k parameter
     order_intensity_k_max: 10.0       # Maximum k parameter
 
+    # VPIN thresholds
     vpin_threshold_normal: 0.4        # VPIN below this is normal
     vpin_threshold_elevated: 0.7      # VPIN above this is elevated
     vpin_threshold_toxic: 0.9         # VPIN above this is toxic

@@ -66,16 +66,23 @@ class AvellanedaStoikovCalculator:
         Args:
             mid_price: Current market mid-price
             inventory_qty: Current inventory (positive = long)
-            volatility: Realized volatility (annualized)
-            remaining_time: Time remaining (seconds)
+            volatility: Per-second realized volatility from volflow_estimator
+            remaining_time: Time remaining in seconds (typically time_horizon from config)
 
         Returns:
             Reservation price (fair value adjusted for inventory)
+
+        Notes:
+            The inventory_adjustment term scales volatility risk with both the current
+            inventory position (q) and the remaining time horizon (T-t). Per-second
+            volatility σ is used; multiplying by remaining_time converts it to the
+            appropriate scale for the order lifetime.
         """
         if volatility <= 0 or remaining_time <= 0:
             return mid_price
 
-        # Inventory adjustment term
+        # Inventory adjustment term: q·γ·σ²_per_second·(T-t)
+        # Where σ is per-second volatility from volflow, and (T-t) is in seconds
         inventory_adjustment = (
             inventory_qty * self.gamma * (volatility ** 2) * remaining_time
         )
