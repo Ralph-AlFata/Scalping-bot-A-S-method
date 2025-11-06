@@ -30,6 +30,7 @@ from shared.schemas import (
     QuoteMessage,
     OrderSpec,
 )
+from shared.sync_client import SyncClient
 
 logger: Optional[object] = None
 
@@ -249,11 +250,17 @@ class AvellanedaStoikovEngine:
         self._last_quote_time = 0.0
         self._quote_interval_ms = float(config.strategy.quoting.update_freq_ms)
 
+        # Initialize sync client
+        self.sync_client = SyncClient(config, self.nats, "as_engine")
+
     async def start(self) -> None:
         """Start service."""
         logger.info("Starting AvellanedaStoikovEngine")
         try:
             await self.nats.connect()
+
+            # Start sync client
+            await self.sync_client.start()
 
             # Subscribe to inputs
             await self.nats.subscribe("features.v1", self.on_features)
@@ -348,8 +355,13 @@ class AvellanedaStoikovEngine:
             return
 
         try:
+            # Wait for sync point
+            sync_point_ms = int(await self.sync_client.wait_for_sync_point(current_time_ms))
+
             quote = await self._generate_quote()
             if quote:
+                # Update quote timestamp to sync point
+                quote.timestamp_ms = sync_point_ms
                 await self.nats.publish("quotes.v1", quote.model_dump_json().encode())
                 self._quotes_published += 1
                 self._last_quote_time = current_time_ms
@@ -442,6 +454,7 @@ class AvellanedaStoikovEngine:
         """Stop service."""
         logger.info("Stopping AvellanedaStoikovEngine")
         self._running = False
+        await self.sync_client.stop()
         await self.nats.close()
         logger.info(
             "AvellanedaStoikovEngine stopped",

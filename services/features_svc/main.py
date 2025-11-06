@@ -33,6 +33,7 @@ from shared.nats_client import NATSClient
 from shared.config import load_config
 from shared.logger import setup_logging, get_logger
 from shared.schemas import DepthSnapshot, TradeMessage, FeatureMessage, OFIData, QueueImbalanceData
+from shared.sync_client import SyncClient
 
 logger: Optional[object] = None
 
@@ -358,11 +359,17 @@ class FeaturesService:
         # Create calculator
         self.calculator = FeatureCalculator(config)
 
+        # Initialize sync client
+        self.sync_client = SyncClient(config, self.nats, "features_svc")
+
     async def start(self) -> None:
         """Start service."""
         logger.info("Starting FeaturesService")
         try:
             await self.nats.connect()
+
+            # Start sync client
+            await self.sync_client.start()
 
             # Subscribe to market data
             await self.nats.subscribe("raw.depth.v1", self.on_depth_message)
@@ -384,10 +391,16 @@ class FeaturesService:
             data = json.loads(msg.data.decode())
             depth = DepthSnapshot(**data)
 
+            # Wait for sync point
+            sync_point_ms = int(await self.sync_client.wait_for_sync_point(depth.timestamp_ms))
+
             # Calculate features
             feature = self.calculator.calculate_features(depth)
 
             if feature:
+                # Update feature timestamp to sync point
+                feature.timestamp_ms = sync_point_ms
+
                 # Publish features
                 await self.nats.publish("features.v1", feature)
                 self._messages_published += 1
@@ -426,6 +439,7 @@ class FeaturesService:
         """Stop service."""
         logger.info("Stopping FeaturesService")
         self._running = False
+        await self.sync_client.stop()
         await self.nats.close()
         logger.info(
             "FeaturesService stopped",

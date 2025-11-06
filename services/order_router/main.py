@@ -12,6 +12,7 @@ from typing import Optional
 from shared.nats_client import NATSClient
 from shared.config import load_config
 from shared.logger import setup_logging, get_logger
+from shared.sync_client import SyncClient
 
 logger: Optional[object] = None
 
@@ -29,11 +30,17 @@ class OrderRouter:
         self._orders_cancelled = 0
         self._errors = 0
 
+        # Initialize sync client
+        self.sync_client = SyncClient(config, self.nats, "order_router")
+
     async def start(self) -> None:
         """Start service."""
         logger.info("Starting OrderRouter")
         try:
             await self.nats.connect()
+
+            # Start sync client
+            await self.sync_client.start()
 
             # Subscribe to quotes
             await self.nats.subscribe("quotes.v1", self.on_quotes)
@@ -58,6 +65,7 @@ class OrderRouter:
         """Stop service."""
         logger.info("Stopping OrderRouter")
         self._running = False
+        await self.sync_client.stop()
         await self.nats.close()
         logger.info(
             "OrderRouter stopped",

@@ -43,6 +43,7 @@ from shared.nats_client import NATSClient
 from shared.config import load_config
 from shared.logger import setup_logging, get_logger
 from shared.schemas import TradeMessage, DepthSnapshot, VolflowMessage, VolatilityData, OrderIntensityData, VPINData, VPINStatus, FeatureMessage, FillMessage
+from shared.sync_client import SyncClient
 
 logger: Optional[object] = None
 
@@ -136,18 +137,29 @@ class VolflowCalculator:
         self.rv_history: Deque[float] = deque(maxlen=self.rv_lookback_periods)
 
         # === State for TSRV (Two-Scale RV) ===
-        self.tsrv_high_freq_returns: Deque[float] = deque(maxlen=3000)  # Last 1 hour of 1.2s returns
-        self.tsrv_low_freq_returns: Deque[float] = deque(maxlen=288)  # Last 24 hours of 5-min returns
+        # Store actual returns (not squared) for proper TSRV calculation
+        self.tsrv_tick_returns: Deque[tuple] = deque(maxlen=3000)  # (timestamp, return) - tick-level returns
+        self.tsrv_low_freq_period_start: Optional[float] = None
+        self.tsrv_low_freq_window_sec = 60  # 60 seconds for low-frequency accumulation
+        self.tsrv_accumulated_return = 0.0  # Accumulating returns for current low-freq period
 
         # === State for Yang-Zhang OHLC ===
         self.current_ohlc: Optional[OHLC] = None
         self.ohlc_1min: Deque[OHLC] = deque(maxlen=60)  # Last 60 minutes of OHLC
         self.ohlc_5min: Deque[OHLC] = deque(maxlen=288)  # Last 24 hours of 5-min OHLC
 
-        # === State for order intensity (k) ===
-        self.k_prev: float = 1.0  # Previous k value (market order intensity)
+        # === State for order intensity (k) and arrival intensity (A) ===
+        self.k_prev: float = 1.0  # Previous k value (spread sensitivity parameter)
+        self.A_prev: float = 1.0  # Previous A value (base arrival intensity)
         self.market_trades: Deque[tuple] = deque()  # (timestamp, quantity) - ALL market trades
         self.last_k_update_time: Optional[float] = None
+
+        # State for order book depth (used for k estimation)
+        self.last_depth_snapshot: Optional[DepthSnapshot] = None
+        self.depth_snapshots: Deque[DepthSnapshot] = deque(maxlen=100)
+
+        # Historical market spread tracking for k estimation
+        self.market_spreads: Deque[float] = deque(maxlen=100)
 
         # === State for fill rate monitoring ===
         self.our_fills: Deque[tuple] = deque()  # (timestamp, quantity) - only OUR fills
@@ -203,9 +215,18 @@ class VolflowCalculator:
         self._cleanup_old_market_trades(timestamp)
 
     def update_depth(self, depth: DepthSnapshot) -> None:
-        """Update with depth snapshot."""
-        # Currently not used in calculations
-        pass
+        """Update with depth snapshot for k parameter estimation."""
+        self.last_depth_snapshot = depth
+        self.depth_snapshots.append(depth)
+
+        # Calculate and store current market spread for k estimation
+        if depth.bids and depth.asks:
+            best_bid = depth.bids[0][0]
+            best_ask = depth.asks[0][0]
+            spread = best_ask - best_bid
+            mid_price = (best_bid + best_ask) / 2.0
+            relative_spread = spread / mid_price if mid_price > 0 else 0
+            self.market_spreads.append(relative_spread)
 
     def update_fill(self, fill: FillMessage) -> None:
         """Update with fill data (our fills only, from fills.v1)."""
@@ -384,15 +405,34 @@ class VolflowCalculator:
             self.rv_current_period_start = timestamp
 
     def _update_tsrv_returns(self, log_return: float, timestamp: float) -> None:
-        """Update returns for TSRV calculation."""
-        self.tsrv_high_freq_returns.append(log_return ** 2)
+        """
+        Update returns for TSRV calculation.
+
+        TSRV requires tick-level returns stored separately, not squared yet.
+        We'll accumulate returns into low-frequency periods during calculation.
+        """
+        # Store tick-level return with timestamp
+        self.tsrv_tick_returns.append((timestamp, log_return))
 
     def _calculate_ewma_volatility(self) -> float:
         """
         Calculate EWMA per-second volatility with time normalization.
 
-        Uses optimized lambda (0.88) for short-horizon crypto trading
-        instead of RiskMetrics 0.94.
+        FIXED VERSION - Handles irregular time intervals properly:
+
+        Theory: When observations arrive at irregular intervals, the decay factor
+        must be adjusted based on actual time elapsed. From RiskMetrics:
+        lambda_adjusted = lambda^(dt_actual / dt_target)
+
+        This ensures that a 2-second gap gives the same weight as two 1-second gaps,
+        rather than treating long intervals the same as short ones.
+
+        Formula with time adjustment:
+        1. Calculate time-adjusted lambda: λ_adj = λ^(dt / dt_target)
+        2. Update variance: σ²ₜ = λ_adj × σ²ₜ₋₁ + (1-λ_adj) × r²/dt
+
+        Note: We normalize the squared return by dt because a return over 2 seconds
+        should contribute twice the variance per second as a return over 1 second.
 
         Returns: Per-second volatility (σ)
         """
@@ -407,30 +447,51 @@ class VolflowCalculator:
                 return self.vol_min
 
             log_return = math.log(latest_price / self.last_price)
-            # Normalize return to per-second basis
-            normalized_return = log_return / math.sqrt(dt_seconds)
 
-            # EWMA update: σ²ₜ = λσ²ₜ₋₁ + (1-λ)r²ₜ (per-second variance)
+            # ========================================
+            # Time-adjusted EWMA with proper handling of irregular intervals
+            # ========================================
+
+            # Target interval: 1 second (our base unit for volatility)
+            dt_target = 1.0
+
+            # Time-adjusted lambda: λ_adj = λ^(dt_actual / dt_target)
+            # This makes the effective decay proportional to time elapsed
+            lambda_adjusted = self.decay_lambda ** (dt_seconds / dt_target)
+            lambda_adjusted_fast = self.decay_lambda_fast ** (dt_seconds / dt_target)
+
+            # Squared return normalized by time interval
+            # Divide by dt because variance accumulates linearly with time
+            squared_return_per_second = (log_return ** 2) / dt_seconds
+
+            # EWMA update with time-adjusted lambda
+            # σ²ₜ = λ_adj × σ²ₜ₋₁ + (1-λ_adj) × (r²/dt)
             self.sigma_squared = (
-                self.decay_lambda * self.sigma_squared +
-                (1 - self.decay_lambda) * (normalized_return ** 2)
+                lambda_adjusted * self.sigma_squared +
+                (1 - lambda_adjusted) * squared_return_per_second
             )
 
-            # Fast EWMA with lambda=0.85 for comparison
+            # Fast EWMA with time-adjusted lambda
             self.sigma_squared_fast = (
-                self.decay_lambda_fast * self.sigma_squared_fast +
-                (1 - self.decay_lambda_fast) * (normalized_return ** 2)
+                lambda_adjusted_fast * self.sigma_squared_fast +
+                (1 - lambda_adjusted_fast) * squared_return_per_second
             )
 
             sigma = math.sqrt(self.sigma_squared)
             return max(self.vol_min, min(sigma, self.vol_max))
 
-        except Exception:
+        except Exception as e:
             return self.vol_min
 
     def _calculate_realized_volatility(self) -> Optional[float]:
         """
-        Calculate per-second realized volatility over recent 2-hour window.
+        Calculate per-second realized volatility over recent window.
+
+        FIXED VERSION - Reduced lookback for faster adaptation:
+
+        Changed from 24 periods (2 hours) to 12 periods (1 hour) by default.
+        For second-to-minute scale trading, a 2-hour window is too slow to react
+        to changing market conditions.
 
         Uses 5-minute buckets to avoid microstructure noise while capturing
         actual volatility in the recent trading period.
@@ -438,19 +499,22 @@ class VolflowCalculator:
         Formula: RV = sqrt(sum(r²_i) / num_seconds)
         where r²_i = squared log returns in each 5-minute period
 
+        The lookback period is now configurable via config.strategy.volflow.rv_lookback_periods
+
         Returns: Per-second volatility (σ)
         """
         if len(self.rv_5min_periods) < 2:
             return None
 
         try:
-            # Calculate RV over last 24 periods (2 hours with 5-min samples)
-            recent_rv = list(self.rv_5min_periods)[-24:]
+            # Calculate RV over last N periods (configurable, default 12 = 1 hour)
+            lookback = min(self.rv_lookback_periods, len(self.rv_5min_periods))
+            recent_rv = list(self.rv_5min_periods)[-lookback:]
             total_rv = sum(recent_rv)
 
             # Convert to per-second volatility
             # Each 5-minute period = 300 seconds
-            num_seconds = len(recent_rv) * 300  # 24 * 300 = 7200 seconds (2 hours)
+            num_seconds = len(recent_rv) * 300
             rv_volatility = math.sqrt(total_rv / num_seconds)
 
             return max(self.vol_min, min(rv_volatility, self.vol_max))
@@ -462,53 +526,130 @@ class VolflowCalculator:
         """
         Calculate Two-Scale Realized Volatility (TSRV) - per-second.
 
-        Robust to microstructure noise by using high-frequency and low-frequency
-        samples to estimate and correct for noise contamination.
+        FIXED VERSION - Addresses dimensional inconsistencies:
 
-        TSRV = sqrt((RV_low - noise_correction) / num_seconds)
+        Theory: TSRV corrects for microstructure noise by comparing RV at different
+        sampling frequencies over the SAME time window. The key insight is that noise
+        gets amplified at higher frequencies.
+
+        Proper implementation:
+        1. Define a time window (e.g., last 20 minutes)
+        2. Calculate high-frequency RV: sum of all tick-level squared returns in window
+        3. Calculate low-frequency RV: accumulate tick returns into 60-second periods,
+           then sum squared accumulated returns
+        4. Both measure variance over the SAME calendar time
+        5. Apply Zhang-Mykland-Aït-Sahalia bias correction
+
+        Formula: TSRV = RV_low - bias_correction
+                 where bias_correction accounts for noise contamination
+                 bias_factor = (avg_spacing - 1) / avg_spacing
+                 avg_spacing = number of high-freq obs per low-freq obs
 
         Returns: Per-second volatility (σ)
         """
-        if len(self.tsrv_high_freq_returns) < 100 or len(self.rv_5min_periods) < 5:
+        if len(self.tsrv_tick_returns) < 100:
             return None
 
         try:
-            # High-frequency RV (sum of squared returns over ~20 minutes)
-            rv_high = sum(list(self.tsrv_high_freq_returns)[-1000:])  # ~1000 samples
+            current_time = time.time()
+            window_sec = 1200  # 20-minute window
 
-            # Low-frequency RV (sum of 4 five-minute periods = 20 minutes)
-            rv_low = sum(list(self.rv_5min_periods)[-4:])
+            # Get tick returns within window
+            cutoff_time = current_time - window_sec
+            window_returns = [(t, r) for t, r in self.tsrv_tick_returns if t >= cutoff_time]
 
-            n_high = min(1000, len(self.tsrv_high_freq_returns))
-            n_low = min(4, len(self.rv_5min_periods))
-
-            if n_high < 100 or n_low < 2:
+            if len(window_returns) < 50:
                 return None
 
-            # Estimate noise variance
-            noise_var = max(0, (rv_high - rv_low) / (n_high - n_low))
+            # ========================================
+            # High-frequency RV: sum of squared tick returns
+            # ========================================
+            rv_high = sum(r ** 2 for _, r in window_returns)
+            n_high = len(window_returns)
 
-            # TSRV with bias correction (sum of squared returns)
-            tsrv = max(0, rv_low - 2 * noise_var * n_low)
+            # ========================================
+            # Low-frequency RV: accumulate into 60-second periods
+            # ========================================
+            # Group returns into 60-second buckets
+            low_freq_returns = []
+            bucket_start = window_returns[0][0]
+            accumulated_return = 0.0
 
+            for timestamp, ret in window_returns:
+                if timestamp - bucket_start >= self.tsrv_low_freq_window_sec:
+                    # Complete current bucket
+                    low_freq_returns.append(accumulated_return)
+                    # Start new bucket
+                    bucket_start = timestamp
+                    accumulated_return = ret
+                else:
+                    # Accumulate into current bucket
+                    accumulated_return += ret
+
+            # Add final bucket if it has data
+            if len(window_returns) > 0:
+                time_in_final_bucket = window_returns[-1][0] - bucket_start
+                if time_in_final_bucket > 0.1 * self.tsrv_low_freq_window_sec:  # At least 10% of period
+                    low_freq_returns.append(accumulated_return)
+
+            if len(low_freq_returns) < 5:  # Need at least 5 low-freq periods
+                return None
+
+            # Calculate low-frequency RV
+            rv_low = sum(r ** 2 for r in low_freq_returns)
+            n_low = len(low_freq_returns)
+
+            # ========================================
+            # Bias correction (Zhang-Mykland-Aït-Sahalia)
+            # ========================================
+            # Average spacing: how many high-freq obs per low-freq obs
+            avg_spacing = n_high / n_low if n_low > 0 else 1
+
+            # Bias factor
+            bias_factor = (avg_spacing - 1) / avg_spacing if avg_spacing > 1 else 0
+
+            # Estimate noise variance from the difference
+            # The difference (rv_high - rv_low) estimates noise contamination
+            noise_contribution = max(0, rv_high - rv_low)
+
+            # Apply bias correction
+            # TSRV = rv_low - bias_factor × noise_contribution / n_low
+            tsrv_var = max(0, rv_low - bias_factor * noise_contribution)
+
+            # ========================================
             # Convert to per-second volatility
-            # Window: 4 periods * 300 seconds/period = 1200 seconds (20 minutes)
-            num_seconds = 4 * 300
-            tsrv_volatility = math.sqrt(tsrv / num_seconds)
+            # ========================================
+            # Total window duration
+            actual_window_duration = window_returns[-1][0] - window_returns[0][0]
+            if actual_window_duration <= 0:
+                return None
+
+            # Per-second variance, then take square root
+            tsrv_volatility = math.sqrt(tsrv_var / actual_window_duration)
 
             return max(self.vol_min, min(tsrv_volatility, self.vol_max))
 
-        except Exception:
+        except Exception as e:
+            logger.debug("Error calculating TSRV", error=str(e))
             return None
 
     def _calculate_har_forecast(self) -> Optional[float]:
         """
         Calculate HAR (Heterogeneous Autoregressive) volatility forecast - per-second.
 
-        HAR-RV: σ²_forecast = β₀ + β₁·RV_daily + β₂·RV_weekly + β₃·RV_monthly
+        FIXED VERSION - Corrected variable naming for crypto 24/7 markets:
 
-        Captures multi-horizon volatility structure. Daily re-estimation of coefficients
-        using 250 days of historical data.
+        HAR-RV: σ²_forecast = β₀ + β₁·RV_1h + β₂·RV_12h + β₃·RV_24h
+
+        In traditional finance, HAR uses daily/weekly/monthly horizons. For crypto
+        trading 24/7 at second-to-minute scale, we adapt these to:
+        - Short-term (rv_1h): Last 12 periods (1 hour) - replaces "daily"
+        - Medium-term (rv_12h): Last 144 periods (12 hours) - replaces "weekly"
+        - Long-term (rv_24h): Last 288 periods (24 hours) - replaces "monthly"
+
+        NOTE: The current implementation uses FIXED coefficients (not estimated from data).
+        For production use, coefficients should be estimated via OLS regression on
+        historical data, which requires collecting at least 250 periods of RV history.
 
         Returns: Per-second volatility (σ)
         """
@@ -525,25 +666,25 @@ class VolflowCalculator:
             if self.har_coefficients is None:
                 return None
 
-            # Calculate HAR components
+            # Calculate HAR components with correct naming
             rv_hist = list(self.rv_history)
 
-            # Daily component (last 12 periods with 5-min buckets = 1 hour)
-            rv_daily = np.mean(rv_hist[-12:]) if len(rv_hist) >= 12 else np.mean(rv_hist)
+            # Short-term component: last 12 periods (1 hour with 5-min buckets)
+            rv_1h = np.mean(rv_hist[-12:]) if len(rv_hist) >= 12 else np.mean(rv_hist)
 
-            # Weekly component (last 144 periods = 12 hours, representing weekly in crypto)
-            rv_weekly = np.mean(rv_hist[-144:]) if len(rv_hist) >= 144 else np.mean(rv_hist)
+            # Medium-term component: last 144 periods (12 hours)
+            rv_12h = np.mean(rv_hist[-144:]) if len(rv_hist) >= 144 else np.mean(rv_hist)
 
-            # Monthly component (last 288 periods = 24 hours, representing monthly in crypto)
-            rv_monthly = np.mean(rv_hist[-288:]) if len(rv_hist) >= 288 else np.mean(rv_hist)
+            # Long-term component: last 288 periods (24 hours)
+            rv_24h = np.mean(rv_hist[-288:]) if len(rv_hist) >= 288 else np.mean(rv_hist)
 
-            # HAR forecast: weighted average of squared returns at different horizons
-            # Each component is already per-second (normalized from rv_5min_periods)
+            # HAR forecast: weighted average of variance at different horizons
+            # Each component is already per-second variance (from rv_5min_periods)
             har_var = (
                 self.har_coefficients.get('beta_0', 0) +
-                self.har_coefficients.get('beta_d', 0.4) * rv_daily +
-                self.har_coefficients.get('beta_w', 0.3) * rv_weekly +
-                self.har_coefficients.get('beta_m', 0.3) * rv_monthly
+                self.har_coefficients.get('beta_1h', 0.4) * rv_1h +
+                self.har_coefficients.get('beta_12h', 0.3) * rv_12h +
+                self.har_coefficients.get('beta_24h', 0.3) * rv_24h
             )
 
             har_vol = math.sqrt(max(0, har_var))
@@ -556,34 +697,63 @@ class VolflowCalculator:
         """
         Estimate HAR coefficients using OLS regression on historical RV data.
 
-        Fit: RV_{t+1} = β₀ + β₁·RV_t + β₂·RV^{5d}_t + β₃·RV^{22d}_t + ε_t
+        FIXED VERSION - Updated coefficient names to reflect actual time periods:
+
+        Fit: RV_{t+1} = β₀ + β₁·RV_1h + β₂·RV_12h + β₃·RV_24h + ε_t
+
+        TODO: For production deployment, implement proper OLS regression using
+        historical data (requires at least 250 periods). The current fixed coefficients
+        (0.4, 0.3, 0.3) are placeholders and may not be optimal for your specific
+        cryptocurrency and market conditions.
         """
         try:
             if len(self.rv_history) < 50:
                 return
 
-            # For now, use simple default coefficients
-            # In production, would fit OLS with historical data
+            # TEMPORARY: Use fixed default coefficients
+            # TODO: Implement OLS estimation with historical data
             self.har_coefficients = {
                 'beta_0': 0.0001,
-                'beta_d': 0.4,  # Daily weight
-                'beta_w': 0.3,  # Weekly weight
-                'beta_m': 0.3   # Monthly weight
+                'beta_1h': 0.4,   # 1-hour horizon weight
+                'beta_12h': 0.3,  # 12-hour horizon weight
+                'beta_24h': 0.3   # 24-hour horizon weight
             }
             self.har_last_reestimate_time = current_time
 
-        except Exception:
-            pass
+            logger.debug(
+                "HAR coefficients set (using fixed values - not estimated from data)",
+                coefficients=self.har_coefficients
+            )
+
+        except Exception as e:
+            logger.debug("Error setting HAR coefficients", error=str(e))
 
     def _calculate_yang_zhang_volatility(self) -> Optional[float]:
         """
         Calculate Yang-Zhang volatility estimator using OHLC data - per-second.
 
-        YZ = sqrt(σ²_night + k·σ²_open-close + (1-k)·σ²_RS)
+        FIXED VERSION - Addresses double-counting time normalization:
 
-        More efficient than close-to-close (14x more efficient for GBM).
-        Handles opening jumps better than standard estimators.
-        Good for 24/7 crypto markets.
+        Theory: Yang-Zhang combines multiple OHLC-based variance components:
+        - Rogers-Satchell (RS): drift-independent range estimator
+        - Garman-Klass (GK): high-low range estimator
+        Each component measures variance for a single OHLC period
+
+        Proper aggregation:
+        1. Calculate Yang-Zhang variance for EACH 5-minute bar separately
+        2. Each estimate is variance for that 300-second period
+        3. Average these variances to get mean variance per 300-second period
+        4. Divide by 300 to get per-second variance
+        5. Take square root to get per-second volatility
+
+        The KEY FIX: Don't average variance components then divide by period length.
+        Instead, recognize each component measures its own 300-second period,
+        so averaging gives mean variance per 300-second period, then convert to per-second.
+
+        Alternative (clearer) approach:
+        For each bar, calculate YZ volatility (vol for 300-sec period),
+        convert to per-second (divide by sqrt(300)),
+        then average those per-second volatilities.
 
         Returns: Per-second volatility (σ)
         """
@@ -593,12 +763,17 @@ class VolflowCalculator:
         try:
             ohlc_data = list(self.ohlc_5min)[-20:]  # Last 20 periods (100 minutes)
 
-            total_yy_var = 0.0
+            if not ohlc_data:
+                return None
+
+            # Calculate per-second volatility for each OHLC bar
+            per_second_vols = []
+
             for ohlc in ohlc_data:
                 if ohlc.open <= 0 or ohlc.high <= 0 or ohlc.low <= 0 or ohlc.close <= 0:
                     continue
 
-                # Rogers-Satchell component
+                # Rogers-Satchell component (drift-independent)
                 rs = math.log(ohlc.high / ohlc.close) * math.log(ohlc.high / ohlc.open) + \
                      math.log(ohlc.low / ohlc.close) * math.log(ohlc.low / ohlc.open)
 
@@ -606,20 +781,26 @@ class VolflowCalculator:
                 hl = math.log(ohlc.high / ohlc.low) ** 2 / (4 * math.log(2))
                 co = (2 * math.log(2) - 1) * (math.log(ohlc.close / ohlc.open) ** 2)
 
-                # Yang-Zhang formula (simplified)
-                yy_component = hl - co + rs
-                total_yy_var += max(0, yy_component)
+                # Yang-Zhang variance for this bar (variance over 300 seconds)
+                yy_var_bar = max(0, hl - co + rs)
 
-            avg_yy_var = total_yy_var / len(ohlc_data) if ohlc_data else 0
+                # Convert to per-second variance then to per-second volatility
+                # This bar represents 300 seconds, so var_per_second = yy_var_bar / 300
+                per_second_var = yy_var_bar / 300.0
+                per_second_vol = math.sqrt(per_second_var)
 
-            # Convert to per-second volatility
-            # Each OHLC period is 5 minutes = 300 seconds
-            num_seconds = 300
-            yy_vol = math.sqrt(max(0, avg_yy_var / num_seconds))
+                per_second_vols.append(per_second_vol)
 
-            return max(self.vol_min, min(yy_vol, self.vol_max))
+            if not per_second_vols:
+                return None
 
-        except Exception:
+            # Average the per-second volatilities
+            avg_yy_vol = np.mean(per_second_vols)
+
+            return max(self.vol_min, min(avg_yy_vol, self.vol_max))
+
+        except Exception as e:
+            logger.debug("Error calculating Yang-Zhang volatility", error=str(e))
             return None
 
     def _calculate_realized_quarticity(self) -> Optional[float]:
@@ -713,46 +894,43 @@ class VolflowCalculator:
 
     def _calculate_order_intensity(self) -> OrderIntensityData:
         """
-        Calculate order intensity (k parameter) using EWMA from MARKET TRADES.
+        Calculate order intensity parameters for Avellaneda-Stoikov framework.
 
         THEORY (Avellaneda-Stoikov 2008):
-            Market order arrival rate: λ(δ) = A × exp(-k × δ)
+            Fill probability: λ(δ) = A × exp(-k × δ)
             where:
-                δ = spread (distance from mid-price)
-                k = order intensity parameter (decay rate) - how quickly order intensity decays
-                A = base arrival intensity
+                λ(δ) = probability of order fill per unit time at distance δ from mid-price
+                A = base arrival intensity (fills per second at δ=0, at mid-price)
+                k = spread sensitivity parameter (how fast fill probability decays with distance)
+                δ = distance from mid-price (spread)
 
-            The k parameter represents how market participants' order arrival rate changes
-            with the spread we quote. High k means aggressive traders dominate (drop off
-            quickly), low k means patient traders dominate (arrive uniformly across spreads).
+        CRITICAL DISTINCTION:
+            - A (arrival intensity): Base rate of market orders (trades/second)
+            - k (spread sensitivity): How sensitive fills are to spread distance
 
-        PRACTICE - MARKET-WIDE APPROACH (Improved):
-            Instead of only observing OUR fills (biased by OUR quotes), we estimate k
-            from MARKET-WIDE order arrival rate using raw.trades.v1:
+            The previous implementation confused these! It calculated A and called it k.
 
-                kₜ = λkₜ₋₁ + (1-λ) × (market_trades_in_interval / interval_duration)
+        IMPLEMENTATION - Three-Method Hybrid:
 
-            This gives us the TRUE market order intensity, not just our interaction with it.
+            1. Calculate A (arrival intensity):
+               Aₜ = λAₜ₋₁ + (1-λ) × (market_trades_in_interval / interval_duration)
+               This is the base market order arrival rate (what the old code calculated).
 
-            Benefits:
-            1. Unbiased estimate of market behavior (not affected by our quoting strategy)
-            2. Adapts to market regimes: calm markets → low k, active markets → high k
-            3. Consistent with Avellaneda-Stoikov theory (measures market order arrival)
+            2. Calculate k (spread sensitivity) using one of three methods:
 
-        COMPLEMENTARY METRIC - OUR FILL RATE:
-            While k reflects market order intensity, we also track our fill rate ratio:
-                fill_rate_ratio = (our_fills_in_interval / interval_duration) /
-                                  (market_trades_in_interval / interval_duration)
+               Method A (Order Book): Fit exponential decay to order book depth
+               If depth follows: depth(δ) ∝ exp(-k × δ)
+               Then k = -slope of log(depth) vs distance
 
-            This tells us if we're being filled more/less than the market average:
-            - ratio > 1: We're getting filled more than market average (too aggressive)
-            - ratio < 1: We're getting filled less than market average (too conservative)
-            - ratio ≈ 1: Neutral position in queue
+               Method B (Simple Heuristic): Use inverse of average market spread
+               k = 1 / average_market_spread
+               Intuition: Tight spreads → high k (steep drop-off)
+                         Wide spreads → low k (gentle drop-off)
 
-        Formula: kₜ = λkₜ₋₁ + (1-λ) × (market_trade_rate)
-        where:
-            λ = decay factor (0.94, same as volatility)
-            market_trade_rate = number of trades per second in market
+               Method C (Fallback): Use configured default if insufficient data
+
+        Returns:
+            OrderIntensityData with k parameter (and A is tracked internally)
         """
         current_time = time.time()
 
@@ -769,22 +947,20 @@ class VolflowCalculator:
             if interval_duration < 0.001:  # Less than 1ms
                 return OrderIntensityData(k=self.k_prev, confidence=0.5)
 
-            # Count MARKET trades in the interval to get market order intensity
+            # ========================================
+            # STEP 1: Calculate A (arrival intensity)
+            # ========================================
             cutoff_time = current_time - interval_duration
             market_trades_in_interval = sum(1 for t, _ in self.market_trades if t > cutoff_time)
             market_trade_rate = market_trades_in_interval / interval_duration
 
-            # Also count OUR fills for ratio calculation
-            our_fills_in_interval = sum(1 for t, _ in self.our_fills if t > cutoff_time)
+            # EWMA update for A: Aₜ = λAₜ₋₁ + (1-λ) × market_trade_rate
+            self.A_prev = self.decay_lambda * self.A_prev + (1 - self.decay_lambda) * market_trade_rate
 
-            # Calculate fill rate ratio for feedback
-            if market_trades_in_interval > 0:
-                self.fill_rate_ratio = our_fills_in_interval / market_trades_in_interval
-            else:
-                self.fill_rate_ratio = 1.0
-
-            # EWMA update: kₜ = λkₜ₋₁ + (1-λ) × market_trade_rate
-            k_new = self.decay_lambda * self.k_prev + (1 - self.decay_lambda) * market_trade_rate
+            # ========================================
+            # STEP 2: Calculate k (spread sensitivity)
+            # ========================================
+            k_new = self._estimate_spread_sensitivity_k()
 
             # Update state
             self.k_prev = k_new
@@ -792,22 +968,34 @@ class VolflowCalculator:
 
             # Bound k
             k = max(self.k_min, min(k_new, self.k_max))
-            k_bounded = k != k_new  # Check if k was capped
+            k_bounded = k != k_new
 
-            # Confidence based on number of recent market trades (more reliable sample)
+            # ========================================
+            # STEP 3: Calculate fill rate ratio (monitoring metric)
+            # ========================================
+            our_fills_in_interval = sum(1 for t, _ in self.our_fills if t > cutoff_time)
+            if market_trades_in_interval > 0:
+                self.fill_rate_ratio = our_fills_in_interval / market_trades_in_interval
+            else:
+                self.fill_rate_ratio = 1.0
+
+            # Confidence based on data availability
             recent_market_trades = sum(1 for t, _ in self.market_trades if t > current_time - self.k_window_sec)
-            confidence = min(0.95, 0.3 + recent_market_trades / 100.0)  # Increased divisor since we get many trades
+            num_spreads = len(self.market_spreads)
+            confidence = min(0.95, 0.3 + (recent_market_trades / 100.0) * 0.3 + (num_spreads / 50.0) * 0.35)
 
             # Log order intensity details
             logger.debug(
                 "Order intensity calculation",
                 market_trades_in_interval=market_trades_in_interval,
-                market_trade_rate=f"{market_trade_rate:.2f} trades/sec",
-                k_unbounded=f"{k_new:.2f}",
-                k_bounded=f"{k:.2f}",
+                A_arrival_intensity=f"{self.A_prev:.2f} trades/sec",
+                k_spread_sensitivity=f"{k:.4f}",
+                k_unbounded=f"{k_new:.4f}",
                 was_capped=k_bounded,
                 k_min=self.k_min,
                 k_max=self.k_max,
+                num_spreads_tracked=len(self.market_spreads),
+                num_depth_snapshots=len(self.depth_snapshots),
                 recent_market_trades=recent_market_trades,
                 confidence=f"{confidence:.2f}",
                 fill_rate_ratio=f"{self.fill_rate_ratio:.3f}"
@@ -818,6 +1006,116 @@ class VolflowCalculator:
         except Exception as e:
             logger.error("Error calculating order intensity", error=str(e))
             return OrderIntensityData(k=self.k_prev, confidence=0.1)
+
+    def _estimate_spread_sensitivity_k(self) -> float:
+        """
+        Estimate k (spread sensitivity parameter) using available data.
+
+        Three methods in order of preference:
+        1. Order book depth exponential decay fitting
+        2. Simple heuristic: k = 1 / average_market_spread
+        3. Fallback: previous k value
+
+        Returns:
+            Estimated k parameter
+        """
+        # Method 1: Try order book fitting if we have depth snapshots
+        if len(self.depth_snapshots) >= 5:
+            k_from_orderbook = self._estimate_k_from_orderbook()
+            if k_from_orderbook is not None:
+                return k_from_orderbook
+
+        # Method 2: Simple heuristic from market spreads
+        if len(self.market_spreads) >= 10:
+            avg_spread = np.mean(list(self.market_spreads)[-20:])
+            if avg_spread > 0:
+                # k = 1 / average_spread (relative spread)
+                # Intuition: tight spreads → high k, wide spreads → low k
+                k_estimate = 1.0 / avg_spread
+
+                # Apply smoothing with previous k
+                k_smoothed = 0.7 * self.k_prev + 0.3 * k_estimate
+                return k_smoothed
+
+        # Method 3: Fallback to previous k
+        return self.k_prev
+
+    def _estimate_k_from_orderbook(self) -> Optional[float]:
+        """
+        Estimate k from order book depth distribution.
+
+        Theory: If depth decays exponentially: depth(δ) = D₀ × exp(-k × δ)
+        Then: log(depth) = log(D₀) - k × δ
+        So k is the negative slope of log(depth) vs distance from mid.
+
+        Returns:
+            Estimated k from order book, or None if insufficient data
+        """
+        try:
+            if not self.last_depth_snapshot:
+                return None
+
+            depth = self.last_depth_snapshot
+            if not depth.bids or not depth.asks:
+                return None
+
+            # Calculate mid price
+            best_bid = depth.bids[0][0]
+            best_ask = depth.asks[0][0]
+            mid_price = (best_bid + best_ask) / 2.0
+
+            if mid_price <= 0:
+                return None
+
+            # Collect (distance, depth) pairs for both sides
+            distances = []
+            depths = []
+
+            # Ask side (distance positive)
+            for price, qty in depth.asks[:10]:  # Use top 10 levels
+                if qty > 0:
+                    distance = abs(price - mid_price) / mid_price  # Relative distance
+                    distances.append(distance)
+                    depths.append(qty)
+
+            # Bid side (distance positive)
+            for price, qty in depth.bids[:10]:
+                if qty > 0:
+                    distance = abs(price - mid_price) / mid_price  # Relative distance
+                    distances.append(distance)
+                    depths.append(qty)
+
+            if len(distances) < 5:  # Need at least 5 points
+                return None
+
+            # Fit exponential decay: log(depth) = a - k × distance
+            # Use numpy for linear regression on log scale
+            log_depths = np.log(np.array(depths))
+            distances_arr = np.array(distances)
+
+            # Simple linear regression: slope = -k
+            # slope = cov(x, y) / var(x)
+            mean_dist = np.mean(distances_arr)
+            mean_log_depth = np.mean(log_depths)
+
+            cov = np.mean((distances_arr - mean_dist) * (log_depths - mean_log_depth))
+            var_dist = np.var(distances_arr)
+
+            if var_dist < 1e-10:  # Avoid division by zero
+                return None
+
+            slope = cov / var_dist
+            k_estimate = -slope  # k = -slope since depth(δ) = exp(-k×δ)
+
+            # Sanity check: k should be positive and reasonable
+            if k_estimate > 0 and k_estimate < 1000:
+                return k_estimate
+
+            return None
+
+        except Exception as e:
+            logger.debug("Error estimating k from order book", error=str(e))
+            return None
 
     def _calculate_vpin(self) -> VPINData:
         """
@@ -1198,11 +1496,17 @@ class VolflowEstimator:
         # Create calculator
         self.calculator = VolflowCalculator(config)
 
+        # Initialize sync client
+        self.sync_client = SyncClient(config, self.nats, "volflow_estimator")
+
     async def start(self) -> None:
         """Start service."""
         logger.info("Starting VolflowEstimator")
         try:
             await self.nats.connect()
+
+            # Start sync client
+            await self.sync_client.start()
 
             # Subscribe to required data streams per specification
             await self.nats.subscribe("raw.trades.v1", self.on_trade)
@@ -1225,12 +1529,17 @@ class VolflowEstimator:
             data = json.loads(msg.data.decode())
             trade = TradeMessage(**data)
 
+            # Wait for sync point
+            sync_point_ms = int(await self.sync_client.wait_for_sync_point(trade.timestamp_ms))
+
             # Update calculator
             self.calculator.update_trade(trade)
 
             # Try to publish volflow estimate
             volflow = self.calculator.calculate_volflow()
             if volflow:
+                # Update volflow timestamp to sync point
+                volflow.timestamp_ms = sync_point_ms
                 await self.nats.publish("volflow.v1", volflow)
                 self._estimates_published += 1
                 logger.debug("Published volflow estimate", published=self._estimates_published)
@@ -1280,6 +1589,7 @@ class VolflowEstimator:
         """Stop service."""
         logger.info("Stopping VolflowEstimator")
         self._running = False
+        await self.sync_client.stop()
         await self.nats.close()
         logger.info(
             "VolflowEstimator stopped",

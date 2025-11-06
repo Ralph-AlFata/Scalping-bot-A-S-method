@@ -12,6 +12,7 @@ from typing import Optional
 from shared.nats_client import NATSClient
 from shared.config import load_config
 from shared.logger import setup_logging, get_logger
+from shared.sync_client import SyncClient
 
 logger: Optional[object] = None
 
@@ -28,11 +29,17 @@ class RiskManager:
         self._alerts_issued = 0
         self._errors = 0
 
+        # Initialize sync client
+        self.sync_client = SyncClient(config, self.nats, "risk_manager")
+
     async def start(self) -> None:
         """Start service."""
         logger.info("Starting RiskManager")
         try:
             await self.nats.connect()
+
+            # Start sync client
+            await self.sync_client.start()
 
             # Subscribe to inventory and market data
             await self.nats.subscribe("inventory.v1", self.on_inventory)
@@ -66,6 +73,7 @@ class RiskManager:
         """Stop service."""
         logger.info("Stopping RiskManager")
         self._running = False
+        await self.sync_client.stop()
         await self.nats.close()
         logger.info(
             "RiskManager stopped",

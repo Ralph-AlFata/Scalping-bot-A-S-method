@@ -13,6 +13,7 @@ from prometheus_client import Counter, Histogram, Gauge
 from shared.nats_client import NATSClient
 from shared.config import load_config
 from shared.logger import setup_logging, get_logger
+from shared.sync_client import SyncClient
 
 logger: Optional[object] = None
 
@@ -25,6 +26,9 @@ class MetricsService:
         self.config = config
         self.nats = NATSClient(config.infrastructure.nats.url)
         self._running = False
+
+        # Initialize sync client
+        self.sync_client = SyncClient(config, self.nats, "metrics_svc")
 
         # Define metrics
         self.messages_received = Counter(
@@ -63,6 +67,9 @@ class MetricsService:
         try:
             await self.nats.connect()
 
+            # Start sync client
+            await self.sync_client.start()
+
             # Subscribe to all metric messages
             await self.nats.subscribe("metrics.v1", self.on_metrics)
 
@@ -84,6 +91,7 @@ class MetricsService:
         """Stop service."""
         logger.info("Stopping MetricsService")
         self._running = False
+        await self.sync_client.stop()
         await self.nats.close()
         logger.info("MetricsService stopped")
 

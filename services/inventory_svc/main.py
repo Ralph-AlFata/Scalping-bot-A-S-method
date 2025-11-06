@@ -12,6 +12,7 @@ from typing import Optional
 from shared.nats_client import NATSClient
 from shared.config import load_config
 from shared.logger import setup_logging, get_logger
+from shared.sync_client import SyncClient
 
 logger: Optional[object] = None
 
@@ -28,11 +29,17 @@ class InventoryService:
         self._inventory_updates = 0
         self._errors = 0
 
+        # Initialize sync client
+        self.sync_client = SyncClient(config, self.nats, "inventory_svc")
+
     async def start(self) -> None:
         """Start service."""
         logger.info("Starting InventoryService")
         try:
             await self.nats.connect()
+
+            # Start sync client
+            await self.sync_client.start()
 
             # Subscribe to trade fills
             await self.nats.subscribe("fill.v1", self.on_fill)
@@ -64,6 +71,7 @@ class InventoryService:
         """Stop service."""
         logger.info("Stopping InventoryService")
         self._running = False
+        await self.sync_client.stop()
         await self.nats.close()
         logger.info(
             "InventoryService stopped",

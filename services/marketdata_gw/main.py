@@ -37,6 +37,7 @@ from shared.nats_client import NATSClient
 from shared.config import load_config
 from shared.logger import setup_logging, get_logger
 from shared.schemas import DepthSnapshot, TradeMessage
+from shared.sync_client import SyncClient
 
 logger: Optional[object] = None
 
@@ -44,16 +45,18 @@ logger: Optional[object] = None
 class BinanceWebSocketManager:
     """Manager for Binance WebSocket streams."""
 
-    def __init__(self, config, on_depth_callback, on_trade_callback):
+    def __init__(self, config, nats_client, on_depth_callback, on_trade_callback):
         """
         Initialize Binance WebSocket manager.
 
         Args:
             config: Configuration object.
+            nats_client: NATS client for sync coordination.
             on_depth_callback: Async callback for depth messages.
             on_trade_callback: Async callback for trade messages.
         """
         self.config = config
+        self.nats_client = nats_client
         self.on_depth_callback = on_depth_callback
         self.on_trade_callback = on_trade_callback
         self.symbol = config.system.symbol.lower()
@@ -71,10 +74,21 @@ class BinanceWebSocketManager:
         self._max_reconnect_delay = 30
         self._errors = 0
 
+        # Initialize sync client
+        self.sync_client = SyncClient(config, nats_client, "marketdata_gw")
+
+        # Sync batching: accumulate messages and sync once per cycle
+        self.sync_interval_ms = config.strategy.quoting.update_freq_ms
+        self.last_sync_ms = time.time() * 1000
+        self.current_sync_point_ms = None
+
     async def start(self) -> None:
         """Start WebSocket streams."""
         logger.info("Starting Binance WebSocket streams")
         self._running = True
+
+        # Start sync client
+        await self.sync_client.start()
 
         # Start both streams concurrently
         depth_task = asyncio.create_task(self._stream_depth())
@@ -87,6 +101,9 @@ class BinanceWebSocketManager:
         """Stop WebSocket streams."""
         logger.info("Stopping Binance WebSocket streams")
         self._running = False
+
+        # Stop sync client
+        await self.sync_client.stop()
 
         if self._ws_depth:
             await self._ws_depth.close()
@@ -174,6 +191,23 @@ class BinanceWebSocketManager:
                 await asyncio.sleep(self._reconnect_delay)
                 self._reconnect_delay = min(self._reconnect_delay * 2, self._max_reconnect_delay)
 
+    async def _get_sync_point(self, data_timestamp_ms: float) -> float:
+        """
+        Get current sync point, requesting new one if needed.
+
+        Uses batching to only request a new sync point every sync_interval_ms,
+        rather than once per message.
+        """
+        current_time_ms = time.time() * 1000
+        time_since_sync = current_time_ms - self.last_sync_ms
+
+        # If we haven't synced recently, request a new sync point
+        if time_since_sync >= self.sync_interval_ms or self.current_sync_point_ms is None:
+            self.last_sync_ms = current_time_ms
+            self.current_sync_point_ms = await self.sync_client.wait_for_sync_point(data_timestamp_ms)
+
+        return self.current_sync_point_ms
+
     async def _process_depth_message(self, data: Dict[str, Any]) -> None:
         """Process depth snapshot from Binance."""
         try:
@@ -194,14 +228,17 @@ class BinanceWebSocketManager:
             timestamp_ms = int(time.time() * 1000)
             exchange_timestamp_ms = data.get("E", timestamp_ms)
 
+            # Get synchronized sync point (batched per sync cycle)
+            sync_point_ms = int(await self._get_sync_point(timestamp_ms))
+
             # Parse bids and asks as floats
             bids = [(float(price), float(qty)) for price, qty in data.get("b", [])]
             asks = [(float(price), float(qty)) for price, qty in data.get("a", [])]
 
-            # Create depth snapshot
+            # Create depth snapshot with synchronized timestamp
             depth = DepthSnapshot(
                 symbol=self.symbol.upper(),
-                timestamp_ms=timestamp_ms,
+                timestamp_ms=sync_point_ms,
                 exchange_timestamp_ms=exchange_timestamp_ms,
                 bids=bids,
                 asks=asks,
@@ -237,10 +274,13 @@ class BinanceWebSocketManager:
 
             timestamp_ms = data.get("E", int(time.time() * 1000))
 
-            # Create trade message
+            # Get synchronized sync point (batched per sync cycle)
+            sync_point_ms = int(await self._get_sync_point(timestamp_ms))
+
+            # Create trade message with synchronized timestamp
             trade = TradeMessage(
                 symbol=self.symbol.upper(),
-                timestamp_ms=timestamp_ms,
+                timestamp_ms=sync_point_ms,
                 trade_id=data.get("a", 0),
                 price=float(data.get("p", 0)),
                 quantity=float(data.get("q", 0)),
@@ -269,6 +309,7 @@ class MarketDataGateway:
         # Create WebSocket manager
         self.ws_manager = BinanceWebSocketManager(
             config,
+            self.nats,
             self.on_depth,
             self.on_trade
         )
