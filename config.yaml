@@ -69,7 +69,9 @@ strategy:
     # inventory_adj = inventory_qty * gamma * (volatility^2) * time_horizon
 
     # EWMA configuration (optimized for short horizons)
-    ewma_lambda: 0.88                 # Decay factor for EWMA (0.88-0.90 for crypto short horizons)
+    # ewma_lambda: 0.88                 # Decay factor for EWMA (0.88-0.90 for crypto short horizons)
+    ewma_halflife: 0.88
+    max_history_seconds: 300
 
     # HAR model configuration
     har_enabled: true                 # Enable HAR forecasting
