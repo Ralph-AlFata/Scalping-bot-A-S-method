@@ -55,7 +55,7 @@ class VolflowCalculator:
 
         # EWMA Configuration
         # self.decay_lambda = getattr(config.strategy.volflow, 'ewma_lambda', 0.88)
-        self.ewma_haflife = getattr(config.strategy.volflow, 'ewma_halflife', 0.88)
+        self.ewma_halflife = getattr(config.strategy.volflow, 'ewma_halflife', 0.88)
         self.max_history_seconds = getattr(config.strategy.volflow, 'max_history_seconds', 300)
 
         # Calculate decay constant for EWMA
@@ -74,10 +74,29 @@ class VolflowCalculator:
         self._last_calculation_time = 0
         self._cache_duration = 0.1 # Cache for 100 ms to avoid recalculation
 
-        self.dt = 0.01 # Sampling frequency. Later on need to unite the sampling frequency across the whole system
+        # ----- Order-intensity configuration ----
+        self.deltas_spreads = getattr(config.strategy.volflow, "deltas", [0.0, 0.1, 0.25, 0.5, 1.0])
+        self.horizon_s = getattr(config.strategy.volflow, "horizon_s", 1.0)
+        self.warmup_minutes = getattr(config.strategy.volflow, "warmup_minutes", 5)
+        self.warmup_end_time = time.time() + self.warmup_minutes * 60
+        self.min_exposure = 60.0 # Check again what is this min_exposure
+        self.min_fills = 3
+        self.k = None 
+        self.A = None 
+        self._lambda_mode = "market_proxy" # Will later switch to "own_fills"
 
-        # The first number in the tuple is the timestamp, the second number is the actual mid price. Just in the beginning, 
-        # since I do not have a unique sampling frequency, I will be saving both then subtracting both timestamps so I can get the instantaneous sampling frequency
+        # buckets for exposure/fills and markets crossings
+        self.market_counts = {
+            "bid": {d: 0 for d in self.deltas_spreads},
+            "ask": {d: 0 for d in self.deltas_spreads}
+        }
+        self.market_expos = {
+            "bid": {d: 0 for d in self.deltas_spreads},
+            "ask": {d: 0 for d in self.deltas_spreads}
+        }
+        self.fill_buckets = {d:{"E": 0.0, "N": 0} for d in self.deltas_spreads}
+
+
                 
     def update_prices(self, depth:DepthSnapshot) -> None:
         """
@@ -295,3 +314,114 @@ class VolflowCalculator:
         self._last_calculation_time = current_time
 
         return sigma_sq_absolute
+
+class VolflowEstimator:
+    """Volatility and order flow estimator service."""
+
+    def __init__(self, config):
+        """Initialize service"""
+        self.config = config 
+        self.nats = NATSClient(config.infrastructure.nats.url)
+        self.running = False 
+        self._measurements = 0
+        self._estimates_published = 0
+        self._errors = 0
+
+        # Create calculator
+        self.calculator = VolflowCalculator(config)
+    
+    async def start(self) -> None:
+        """Start service."""
+        logger.info("Starting VolflowEstimator")
+        try:
+            await self.nats.connect()
+
+            # Subscribe to required data streams per verification
+            await self.nats.subscribe("raw.depth.v1", self.on_depth)
+
+            self._running = True 
+            logger.info("VolflowEstimator ready")
+        
+        except Exception as e:
+            logger.error("Failed to start VolflowEstimator", error=str(e))
+            raise
+    
+    async def on_depth(self, msg) -> None:
+        """Handle depth messages."""
+        try:
+            self._measurements += 1
+
+            # Parse message
+            data = json.loads(msg.data.decode())
+            depth = DepthSnapshot(**data)
+
+            # Update calculator
+            self.calculator.update_prices(depth)
+        
+        except json.JSONDecodeError as e:
+            logger.error("Failed to decode depth message", error=str(e))
+            self._errors += 1
+        except Exception as e:
+            logger.error("Error processing depth message", error=str(e))
+            self._errors += 1
+    
+    async def stop(self) -> None:
+        """Stop service"""
+        logger.info("Stopping VolflowEstimator")
+        self._running = False 
+        await self.nats.close()
+        
+        await self.nats.close()
+        logger.info(
+            "VolflowEstimator stopped",
+            measurements=self._measurements,
+            estimates_published=self._estimates_published,
+            errors=self.errors,
+        )
+
+    async def run(self) -> None:
+        """Main service loop."""
+        try:
+            await self.start()
+            while self._running:
+                await asyncio.sleep(1)
+        
+        except asyncio.CancelledError:
+            logger.info("Service cancelled")
+        
+        except Exception as e:
+            logger.error("Service error", error=str(e))
+
+        finally:
+            await self.stop()
+
+async def main() -> None:
+    """Main entry point"""
+    global logger 
+    config = load_config()
+    logger = setup_logging(
+        "volflow_estimator",
+        level=config.system.log_level,
+        log_format=config.system.log_format,
+    )
+
+    logger.info("Initializing VolflowEstimator")
+
+    service = VolflowEstimator(config)
+
+    def signal_handler(sig, frame):
+        logger.warning("Received signal", signal=sig)
+        asyncio.create_task(service.stop())
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    try:
+        await service.run()
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt")
+        await service.stop()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+

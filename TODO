@@ -1,3 +1,5 @@
 1. Need to unite the whole system with a single clock
 
 2. In volflow calculator, explore the idea of sorting timestamps, in case the orders come in the wrong order for some reason.
+
+3. To be able to calculate the probability of fill k, I can do at first a 5 minute startup time for the algorithm, where it starts gathering data on startup, and then later on when it has enough data it can start putting actual limit orders
