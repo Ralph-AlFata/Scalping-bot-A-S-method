@@ -60,9 +60,9 @@ class VolflowCalculator:
 
         # Calculate decay constant for EWMA
         # λ = ln(2) / halflife
-        self.decay_constant = np.log(2) / self.ewma_haflife
+        self.decay_constant = np.log(2) / self.ewma_halflife
 
-        # Binance socket updates at a rat of 100ms, therefore there are 10 updates per second
+        # Binance socket updates at a rates of 100ms, therefore there are 10 updates per second
         # Storage: (timestamps, mid_price)
         # Keep enough history for the EWMA calculation
         max_samples = int(self.max_history_seconds * 10)
@@ -119,7 +119,7 @@ class VolflowCalculator:
         Compute realized volatility over the current queue of mid prices.
         
         Uses squared returns normalized by time differences:
-            σ² = (1 / T) * Σ[(Δp)² / Δt]
+            σ² = (1 / T) * Σ[(Δp)²]
         where:
             Δp = price difference between consecutive samples
             Δt = time difference between consecutive timestamps
@@ -165,7 +165,7 @@ class VolflowCalculator:
         Realized volatility using LOG RETURNS with time normalization.
         
         Formula:
-            σ² = (1/T) * Σ[(ln(p_i/p_{i-1}))² / Δt_i]
+            σ² = (1/T) * Σ[(ln(p_i/p_{i-1}))²]
             σ = sqrt(σ²)
         
         Returns:
@@ -246,6 +246,18 @@ class VolflowCalculator:
         if len(log_returns) < 2:
             return None 
         
+        # ==== Robust filtering ====
+        min_dt = 0.05 # ignore intervals < 50 ms (too noisy)
+        max_r = 0.02 # ignore log returns > 2% per tick (crazy spikes)
+
+        stable_mask = (delta_t >= min_dt) & (np.abs(log_returns) < max_r)
+        if not np.any(stable_mask):
+            return None
+        
+        delta_t = delta_t[stable_mask]
+        log_returns = log_returns[stable_mask]
+        timestamps_mid = timestamps_mid[stable_mask]
+
         # Time-normalize the squared returns
         # This gives us (dimensionless)² / second
         normalized_squared_returns = np.square(log_returns) / delta_t 
@@ -256,8 +268,8 @@ class VolflowCalculator:
         # Weight: w_i = exp(-λ × (T - t_i))
         # where T is the most recent time, t_i is time of observation i
 
-        current_time = timestamps_mid[-1]
-        time_from_end = current_time - timestamps_mid
+        t_now = timestamps_mid[-1]
+        time_from_end = t_now - timestamps_mid
 
         # Calculate exponential weights
         weights = np.exp(-self.decay_constant * time_from_end)
@@ -269,6 +281,15 @@ class VolflowCalculator:
         # σ²_log = Σ(w_i × r_i²/Δt_i)
         variance_log_per_second = np.sum(weights * normalized_squared_returns)
 
+        variance_log_per_second = float(np.squeeze(variance_log_per_second))
+
+        # ===== Spike suppression =====
+        if hasattr(self, "_prev_variance_log"):
+            prev = self._prev_variance_log
+            if variance_log_per_second > 5 * prev:
+                variance_log_per_second = 5 * prev + 0.0  # cap at 5× previous
+
+        self._prev_variance_log = variance_log_per_second
         return variance_log_per_second
 
     def _get_variance_for_AS_model(self) -> Optional[float]:    
@@ -307,6 +328,7 @@ class VolflowCalculator:
         # Units: ($/BTC)²/second = (1/second) × ($/BTC)²
         last_mid_price = self.price_history[-1][1]
         sigma_sq_absolute = sigma_sq_log * (last_mid_price ** 2)
+        sigma_sq_absolute = float(np.squeeze(sigma_sq_absolute))
 
         # Cache the result
         self._last_sigma_sq_log = sigma_sq_log
@@ -314,6 +336,166 @@ class VolflowCalculator:
         self._last_calculation_time = current_time
 
         return sigma_sq_absolute
+    
+    def _update_market_proxy(self):
+        """
+        Estimate market-proxy crossing counts from stored price history.
+        Used during warm-up to fit λ(δ)=A·exp(−k·δ_rel)
+        """
+        if len(self.price_history) < 2:
+            return None
+
+        arr = np.array(self.price_history, dtype=float)
+        times = arr[:, 0] / 1000.0
+        prices = arr[:, 1]
+        horizon = self.horizon_s
+
+        j = 0
+        for i, t in enumerate(times):
+            while j<len(times) and times[j]-t <= horizon:
+                j += 1
+            
+            window_prices = prices[i:j]
+            if len(window_prices) < 2:
+                continue 
+
+            s0 = prices[i]
+            up = max(window_prices) - s0 
+            down = s0 - min(window_prices)
+
+            for d in self.deltas_spreads:
+                # Upward move -> potential ASK fill
+                self.market_expos["ask"][d] += 1
+                if up >= d:
+                    self.market_counts["ask"][d] += 1
+                
+                # Downward move -> potential BID fill
+                self.market_expos["bid"][d] += 1
+                if down >= d:
+                    self.market_counts["bid"][d] += 1
+
+    def _fit_market_proxy(self, side="bid"):
+        """
+        Fit λ(δ)=A·e^{-kδ} for one side of the book ('bid' or 'ask'). 
+        """
+        xs, ys = [], []
+        counts_dict = self.market_counts[side]
+        expos_dict = self.market_expos[side]
+
+        for d in self.deltas_spreads:
+            expos = expos_dict[d]
+            counts = counts_dict[d]
+            if expos<=self.min_exposure:
+                continue
+
+            lam_hat = (counts/expos) / self.horizon_s
+            if lam_hat > 0 and np.isfinite(lam_hat):
+                xs.append(d)
+                ys.append(np.log(lam_hat))
+        
+        if len(xs) < 2:
+            return None 
+        
+        xs = np.asarray(xs, dtype=float)
+        ys = np.asarray(ys, dtype=float)
+
+        X = np.column_stack([np.ones_like(xs), xs])
+        beta, *_ = np.linalg.lstsq(X, ys, rcond=None)
+        lnA, negk = beta
+
+        A = float(np.exp(lnA))
+        k = float(-negk)
+
+        # Basic sanity
+        if not (np.isfinite(A) and np.isfinite(k) and A > 0 and k >= 0):
+            return None
+
+        return A, k
+
+    def _smooth_Ak(self, new_A, new_k, alpha=0.2):
+        """
+        EWMA smoothing for A and k parameters to reduce noise between fits
+        α = 0.2 means 20% weight to new estimate, 80% to previous.
+        """
+        if new_A is None or new_k is None:
+            return
+        
+        # Initialize first time
+        if not hasattr(self, "_prev_A"):
+            self._prev_A, self._prev_k = new_A, new_k
+
+        self.A = alpha * new_A + (1 - alpha) * self._prev_A
+        self.k = alpha * new_k + (1 - alpha) * self._prev_k
+
+        self._prev_A, self._prev_k = self.A, self.k
+        
+        
+    
+    # TODO: implement _update_own_fill() where I start calculating A and k based on my own fills, instead of ones from the market directly
+
+    def _calculate_volflow(self):
+        """
+        Orchestrates:
+        - volatility (σ²_abs via EWMA log-return path → also compute σ)
+        - (A,k) via market proxy on both sides with smoothing
+        - bucket resets after each fit
+        Returns a VolflowMessage or None if not ready.
+        """
+        current_time = time.time()
+
+        # -------------------------
+        # Warmup phase handling
+        # -------------------------
+        if current_time < self.warmup_end_time:
+            logger.debug("Warmup period active — skipping λ fit")
+            return None
+        
+        try:
+            # -------------------------
+            # Step 1: Compute volatility
+            # -------------------------
+            vol_data = self._get_variance_for_AS_model()
+            if vol_data is None:
+                logger.debug("Not enough price data for volatility estimation")
+                return None
+
+            # -------------------------
+            # Step 2: Compute order intensity (A,k)
+            # -------------------------
+            A_bidk = self._fit_market_proxy("bid")
+            A_askk = self._fit_market_proxy("ask")
+
+            if A_bidk and A_askk:
+                A_bid, k_bid = A_bidk
+                A_ask, k_ask = A_askk
+                A_mean = (A_bid + A_ask) / 2
+                k_mean = (k_bid + k_ask) / 2
+                self._smooth_Ak(A_mean, k_mean)
+            else:
+                logger.debug("Insufficient data for λ fit")
+                return None
+
+            # -------------------------
+            # Step 3: Reset buckets after fit
+            # -------------------------
+            for side in ["bid", "ask"]:
+                for d in self.deltas_spreads:
+                    self.market_counts[side][d] = 0
+                    self.market_expos[side][d] = 0
+            # TODO: Add the rest of the measurements
+            # TODO: Add confidence for the volatility
+            message = VolflowMessage(
+                symbol=self.symbol,
+                timestamp_ms=int(current_time*1000),
+                volatility=VolatilityData(value=vol_data, confidence=0.9), # Just for testing purposes, I now have the confidence constant. TODO: NEED TO CALCULATE THIS LATER
+                order_intensity=OrderIntensityData(k=self.k, confidence=0.8), # Just for testing purposes, I now have the confidence constant. TODO: NEED TO CALCULATE THIS LATER
+                vpin=VPINData(value=1.0, status=VPINStatus.NORMAL), # Just for testing purposes now
+            )
+            return message
+        
+        except Exception as e:
+            logger.error("Error calculating volflow", error=str(e))
+
 
 class VolflowEstimator:
     """Volatility and order flow estimator service."""
@@ -368,15 +550,14 @@ class VolflowEstimator:
     async def stop(self) -> None:
         """Stop service"""
         logger.info("Stopping VolflowEstimator")
-        self._running = False 
-        await self.nats.close()
+        self._running = False
         
         await self.nats.close()
         logger.info(
             "VolflowEstimator stopped",
             measurements=self._measurements,
             estimates_published=self._estimates_published,
-            errors=self.errors,
+            errors=self._errors,
         )
 
     async def run(self) -> None:
@@ -385,6 +566,11 @@ class VolflowEstimator:
             await self.start()
             while self._running:
                 await asyncio.sleep(1)
+                self.calculator._update_market_proxy()
+                msg = self.calculator._calculate_volflow()
+                if msg:
+                    await self.nats.publish("volflow.v1", msg.json().encode())
+                    self._estimates_published += 1
         
         except asyncio.CancelledError:
             logger.info("Service cancelled")
